@@ -1,0 +1,92 @@
+{
+  "expo": {
+    "name": "BioBalance",
+    "slug": "nature-bot",
+    "scheme": "biobalance",
+    "version": "1.0.0",
+    "sdkVersion": "54.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/logo.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#FFFFFF"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.naturebot.app",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      },
+      "associatedDomains": [
+        "applinks:xnynrlctilanhcexkfse.supabase.co"
+      ]
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/logo.png",
+        "backgroundColor": "#FFFFFF"
+      },
+      "package": "com.naturebot.app",
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "האפליקציה זקוקה לגישה לתמונות כדי לזהות מזון.",
+          "cameraPermission": "האפליקציה זקוקה לגישה למצלמה כדי לצלם מזון."
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "האפליקציה זקוקה לגישה למצלמה כדי לצלם מזון."
+        }
+      ],
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/logo.png",
+          "color": "#4CAF50",
+          "sounds": []
+        }
+      ],
+      "expo-web-browser"
+    ],
+    "notification": {
+      "icon": "./assets/logo.png",
+      "color": "#4CAF50",
+      "androidMode": "default",
+      "androidCollapsedTitle": "BioBalance"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "b157cbea-c910-42b8-9a61-2176df385f8f"
+      }
+    },
+    "owner": "eliav2611",
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/b157cbea-c910-42b8-9a61-2176df385f8f"
+    }
+  }
+}

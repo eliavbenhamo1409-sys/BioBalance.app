@@ -1,0 +1,33 @@
+{
+  "cli": {
+    "version": ">= 3.0.0",
+    "appVersionSource": "remote"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development"
+    },
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview"
+    },
+    "production": {
+      "autoIncrement": true,
+      "channel": "production"
+    }
+  },
+  "submit": {
+    "production": {
+      "ios": {
+        "appleId": "eliav.ben.hamo@icloud.com",
+        "appleTeamId": "4T29TB84F4",
+        "ascAppId": "6756488694",
+        "ascApiKeyPath": "C:\\Users\\eliav\\Desktop\\AuthKey_C3482WJ78N.p8",
+        "ascApiKeyIssuerId": "50f28fbf-177e-4310-8a5e-ad42cccd2071",
+        "ascApiKeyId": "C3482WJ78N"
+      }
+    }
+  }
+}
