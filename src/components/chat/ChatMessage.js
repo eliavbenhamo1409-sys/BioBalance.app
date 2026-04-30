@@ -1,5 +1,5 @@
 import React, { memo, useEffect } from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import { View, Text, StyleSheet, Pressable } from 'react-native';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -16,12 +16,49 @@ const SPRING_CONFIG = {
   overshootClamping: false,
 };
 
-function ChatMessage({ message, isBot }) {
+const BRAND = '#32A728';
+
+/** ממיר **מודגש** ל־Text מקונן — בלי להציג את כתבי ה־markdown */
+function BubbleRichText({ text, isBot, isNote }) {
+  const baseStyle = isNote
+    ? [styles.brachotNote]
+    : [styles.text, isBot ? styles.botText : styles.userText];
+  const boldStyle = isNote
+    ? styles.brachotNoteEmphasis
+    : isBot
+      ? styles.botTextEmphasis
+      : styles.userTextEmphasis;
+  const s = String(text ?? '');
+  if (!s.includes('**')) {
+    return <Text style={baseStyle}>{s}</Text>;
+  }
+  const parts = s.split(/\*\*/);
+  return (
+    <Text style={baseStyle}>
+      {parts.map((part, i) =>
+        i % 2 === 0 ? (
+          part
+        ) : (
+          <Text key={i} style={[baseStyle, boldStyle]}>
+            {part}
+          </Text>
+        ),
+      )}
+    </Text>
+  );
+}
+
+function ChatMessage({ message, isBot, actionButton, brachotLayout }) {
   const progress = useSharedValue(0);
 
   useEffect(() => {
     progress.value = withSpring(1, SPRING_CONFIG);
   }, []);
+
+  const showBrachot =
+    isBot &&
+    brachotLayout &&
+    (brachotLayout.before || brachotLayout.after || brachotLayout.note);
 
   const containerStyle = useAnimatedStyle(() => {
     const translateX = isBot 
@@ -52,9 +89,56 @@ function ChatMessage({ message, isBot }) {
         </Animated.View>
       )}
       <View style={[styles.bubble, isBot ? styles.botBubble : styles.userBubble]}>
-        <Text style={[styles.text, isBot ? styles.botText : styles.userText]}>
-          {message}
-        </Text>
+        {showBrachot ? (
+          <View style={styles.brachotWrap}>
+            {brachotLayout.before ? (
+              <Text style={[styles.text, styles.botText]}>
+                <Text style={styles.brachotLabel}>לפני</Text>
+                {'\n'}
+                <BubbleRichText text={brachotLayout.before} isBot />
+              </Text>
+            ) : null}
+            {brachotLayout.after ? (
+              <Text
+                style={[
+                  styles.text,
+                  styles.botText,
+                  brachotLayout.before ? styles.brachotBlockSpacer : null,
+                ]}
+              >
+                <Text style={styles.brachotLabel}>אחרי</Text>
+                {'\n'}
+                <BubbleRichText text={brachotLayout.after} isBot />
+              </Text>
+            ) : null}
+            {brachotLayout.note ? (
+              <View
+                style={
+                  brachotLayout.before || brachotLayout.after
+                    ? styles.brachotBlockSpacer
+                    : null
+                }
+              >
+                <BubbleRichText text={brachotLayout.note} isBot isNote />
+              </View>
+            ) : null}
+          </View>
+        ) : (
+          <BubbleRichText text={message} isBot={isBot} />
+        )}
+        {isBot && actionButton?.label && actionButton?.onPress ? (
+          <Pressable
+            onPress={actionButton.onPress}
+            style={({ pressed }) => [
+              styles.actionBtn,
+              pressed && styles.actionBtnPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={actionButton.label}
+          >
+            <Text style={styles.actionBtnText}>{actionButton.label}</Text>
+          </Pressable>
+        ) : null}
       </View>
     </Animated.View>
   );
@@ -63,6 +147,37 @@ function ChatMessage({ message, isBot }) {
 export default memo(ChatMessage);
 
 const styles = StyleSheet.create({
+  brachotWrap: {
+    alignSelf: 'stretch',
+  },
+  brachotLabel: {
+    fontSize: 15,
+    lineHeight: 22,
+    fontWeight: '800',
+    color: '#0F172A',
+    textAlign: 'right',
+  },
+  brachotBlockSpacer: {
+    marginTop: 14,
+  },
+  brachotNote: {
+    fontSize: 13,
+    lineHeight: 20,
+    color: '#64748B',
+    textAlign: 'right',
+  },
+  brachotNoteEmphasis: {
+    fontWeight: '800',
+    color: '#64748B',
+  },
+  botTextEmphasis: {
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  userTextEmphasis: {
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
   container: {
     flexDirection: 'row',
     marginVertical: 5,
@@ -134,5 +249,24 @@ const styles = StyleSheet.create({
   userText: {
     color: '#FFFFFF',
     textAlign: 'right',
+  },
+  actionBtn: {
+    marginTop: 12,
+    alignSelf: 'stretch',
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    borderWidth: 1.5,
+    borderColor: BRAND,
+    backgroundColor: '#F0FDF4',
+  },
+  actionBtnPressed: {
+    opacity: 0.85,
+  },
+  actionBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: BRAND,
+    textAlign: 'center',
   },
 });

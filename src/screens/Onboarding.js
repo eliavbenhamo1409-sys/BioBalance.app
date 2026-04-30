@@ -5,7 +5,6 @@ import {
   StyleSheet,
   TouchableOpacity,
   TextInput,
-  SafeAreaView,
   Dimensions,
   Platform,
   ScrollView,
@@ -14,6 +13,7 @@ import {
   ActivityIndicator,
   Keyboard,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -29,10 +29,11 @@ import Animated, {
 } from 'react-native-reanimated';
 import { LinearGradient } from 'expo-linear-gradient';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useNotifications } from '../hooks/useNotifications';
+import { useNotifications, LAST_FOOD_LOG_KEY } from '../hooks/useNotifications';
 import { useNavigation } from '@react-navigation/native';
 import { useApp } from '../context/AppContext';
-import { calculateNutritionTargets } from '../api/openaiClient';
+import { calculateNutritionTargets } from '../api/aiClient';
+import SourceCitation from '../components/SourceCitation';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -496,14 +497,48 @@ export default function Onboarding() {
   const [isCalculating, setIsCalculating] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false); // Add submitting state
   const [showResults, setShowResults] = useState(false);
-  
+
+  // Pull display name from auth provider metadata (Apple/Google etc.) so we don't
+  // re-ask for info already provided by the Authentication Services framework.
+  // Required for Apple App Review Guideline 4.0 (Sign in with Apple).
+  const getProviderName = (u) => {
+    if (!u) return '';
+    const md = u.user_metadata || {};
+    const candidates = [
+      md.full_name,
+      md.name,
+      md.display_name,
+      [md.given_name, md.family_name].filter(Boolean).join(' ').trim(),
+      [md.first_name, md.last_name].filter(Boolean).join(' ').trim(),
+    ];
+    const fromMeta = candidates.find((v) => typeof v === 'string' && v.trim().length > 0);
+    if (fromMeta) return fromMeta.trim();
+
+    const identities = Array.isArray(u.identities) ? u.identities : [];
+    for (const ident of identities) {
+      const id = ident?.identity_data || {};
+      const idCandidates = [
+        id.full_name,
+        id.name,
+        id.display_name,
+        [id.given_name, id.family_name].filter(Boolean).join(' ').trim(),
+      ];
+      const fromIdent = idCandidates.find((v) => typeof v === 'string' && v.trim().length > 0);
+      if (fromIdent) return fromIdent.trim();
+    }
+    return '';
+  };
+
+  const initialName = getProviderName(user);
+
   // User data
-  const [userName, setUserName] = useState('');
+  const [userName, setUserName] = useState(initialName);
   const [gender, setGender] = useState(null);
   const [weight, setWeight] = useState('');
   const [height, setHeight] = useState('');
   const [age, setAge] = useState('');
   const [activityLevel, setActivityLevel] = useState(null);
+  const [activityLevelNotes, setActivityLevelNotes] = useState('');
   const [goal, setGoal] = useState(null);
   const [pace, setPace] = useState(null);
   
@@ -527,6 +562,13 @@ export default function Onboarding() {
     contentProgress.value = withDelay(200, withSpring(1, SPRING_CONFIG));
   }, [step]);
 
+  useEffect(() => {
+    if (!userName) {
+      const fromAuth = getProviderName(user);
+      if (fromAuth) setUserName(fromAuth);
+    }
+  }, [user]);
+
   const titleStyle = useAnimatedStyle(() => ({
     opacity: interpolate(titleProgress.value, [0, 1], [0, 1], Extrapolate.CLAMP),
     transform: [
@@ -548,7 +590,15 @@ export default function Onboarding() {
   const goToNextStep = () => {
     titleProgress.value = 0;
     contentProgress.value = 0;
-    setStep(prev => prev + 1);
+    setStep(prev => {
+      const next = prev + 1;
+      // Skip the name step if Apple / Google already provided a name.
+      // Apple Guideline 4.0 forbids re-asking for info from Authentication Services.
+      if (next === 1 && userName.trim().length > 0) {
+        return 2;
+      }
+      return next;
+    });
   };
 
   const calculateResults = async () => {
@@ -560,17 +610,18 @@ export default function Onboarding() {
         weight_kg: parseFloat(weight),
         height_cm: parseFloat(height),
         age: parseInt(age),
-        activity_level: activityLevel,
+        activity_level: activityLevel != null ? activityLevel : 'moderate',
+        activity_level_notes:
+          activityLevel != null ? undefined : (activityLevelNotes.trim() || undefined),
         goal,
         pace,
       };
 
-      console.log('Sending to OpenAI for calculation:', userData);
-      
-      // Use OpenAI for professional calculation
+      console.log('Sending to AI (Gemini) for calculation:', userData);
+
       const aiResults = await calculateNutritionTargets(userData);
-      
-      console.log('Received from OpenAI:', aiResults);
+
+      console.log('Received from AI:', aiResults);
 
       const calculatedResults = {
         calories: aiResults.calories,
@@ -622,7 +673,8 @@ export default function Onboarding() {
       weight_kg: parseFloat(weight),
       height_cm: parseFloat(height),
       age: parseInt(age),
-      activity_level: activityLevel,
+      activity_level: activityLevel != null ? activityLevel : 'moderate',
+      activity_level_notes: activityLevel != null ? null : (activityLevelNotes.trim() || null),
       goal,
       pace,
       calories_target: editedCalories || results.calories,
@@ -669,6 +721,7 @@ export default function Onboarding() {
         calories: 0,
         protein: 0,
         fat: 0,
+        carbs: 0,
         water_glasses: 0,
       };
       setDailyStats(initialStats).catch(e => console.log('[Onboarding] Stats error:', e));
@@ -684,6 +737,11 @@ export default function Onboarding() {
         routes: [{ name: 'Home' }],
       });
       
+      // Seed last-food-log so the 3.5h inactivity nudge doesn't fire
+      // the moment a fresh user finishes onboarding.
+      AsyncStorage.setItem(LAST_FOOD_LOG_KEY, Date.now().toString())
+        .catch((e) => console.log('[Onboarding] seed last food log skipped:', e));
+
       // Request notification permission AFTER navigation (non-blocking)
       setTimeout(() => {
         initializeForNewUser().catch(e => console.log('[Onboarding] Notification setup skipped:', e));
@@ -707,7 +765,12 @@ export default function Onboarding() {
       case 1: return userName.trim().length > 0;
       case 2: return gender !== null;
       case 3: return weight && height && age;
-      case 4: return activityLevel !== null;
+      case 4: {
+        const notes = activityLevelNotes.trim();
+        const preset = activityLevel !== null;
+        if (preset && notes.length > 0) return false;
+        return (preset && notes.length === 0) || (!preset && notes.length >= 3);
+      }
       case 5: return goal !== null;
       case 6: return pace !== null;
       default: return false;
@@ -854,7 +917,7 @@ export default function Onboarding() {
               רמת הפעילות שלך 🏃
             </Animated.Text>
             <Animated.Text style={[styles.stepSubtitle, titleStyle]}>
-              כמה הגוף שלך פעיל ביום-יום?
+              או מהרשימה או בכתיבה למטה — לא שניהם.
             </Animated.Text>
             <Animated.View style={contentStyle}>
               <ScrollView style={styles.optionsScroll} showsVerticalScrollIndicator={false}>
@@ -863,39 +926,67 @@ export default function Onboarding() {
                     label="יושב/ת רוב היום"
                     icon="🛋️"
                     selected={activityLevel === 'sedentary'}
-                    onPress={() => setActivityLevel('sedentary')}
+                    onPress={() => {
+                      setActivityLevel('sedentary');
+                      setActivityLevelNotes('');
+                    }}
                     delay={100}
                   />
                   <OptionButton
                     label="פעילות קלה – הליכות"
                     icon="🚶"
                     selected={activityLevel === 'light'}
-                    onPress={() => setActivityLevel('light')}
+                    onPress={() => {
+                      setActivityLevel('light');
+                      setActivityLevelNotes('');
+                    }}
                     delay={150}
                   />
                   <OptionButton
                     label="אימונים 2-3 בשבוע"
                     icon="🏃"
                     selected={activityLevel === 'moderate'}
-                    onPress={() => setActivityLevel('moderate')}
+                    onPress={() => {
+                      setActivityLevel('moderate');
+                      setActivityLevelNotes('');
+                    }}
                     delay={200}
                   />
                   <OptionButton
                     label="אימונים 4-5 בשבוע"
                     icon="💪"
                     selected={activityLevel === 'active'}
-                    onPress={() => setActivityLevel('active')}
+                    onPress={() => {
+                      setActivityLevel('active');
+                      setActivityLevelNotes('');
+                    }}
                     delay={250}
                   />
                   <OptionButton
                     label="אימונים יומיים אינטנסיביים"
                     icon="🔥"
                     selected={activityLevel === 'intense'}
-                    onPress={() => setActivityLevel('intense')}
+                    onPress={() => {
+                      setActivityLevel('intense');
+                      setActivityLevelNotes('');
+                    }}
                     delay={300}
                   />
                 </View>
               </ScrollView>
+              <TextInput
+                style={styles.activityNotesInput}
+                value={activityLevelNotes}
+                onChangeText={(t) => {
+                  setActivityLevelNotes(t);
+                  if (t.trim()) setActivityLevel(null);
+                }}
+                placeholder="אחרת: כאן במילים שלך (3+ תווים)"
+                placeholderTextColor="#94A3B8"
+                multiline
+                textAlign="right"
+                textAlignVertical="top"
+              />
             </Animated.View>
           </>
         );
@@ -1248,6 +1339,8 @@ export default function Onboarding() {
               <Text style={styles.editInfoText}>✏️ לחץ על ערך לעריכה</Text>
             </View>
           </Animated.View>
+
+          <SourceCitation variant="full" />
         </View>
 
         {/* Bottom CTA */}
@@ -1305,6 +1398,7 @@ export default function Onboarding() {
               style={[
                 styles.nextBtn,
                 step === 0 && styles.nextBtnBrand,
+                step === 6 && styles.nextBtnSubmit,
                 !canProceed() && styles.nextBtnDisabled,
               ]}
               onPress={() => {
@@ -1317,9 +1411,32 @@ export default function Onboarding() {
               disabled={!canProceed()}
               activeOpacity={0.85}
             >
-              <Text style={[styles.nextBtnText, step === 0 && styles.nextBtnTextBrand]}>
-                {step === 0 ? 'להתחיל התאמה אישית' : step === 6 ? 'חשב את המאזן שלי' : 'המשך'}
-              </Text>
+              {step === 0 ? (
+                <Text style={[styles.nextBtnText, styles.nextBtnTextBrand]}>
+                  להתחיל התאמה אישית
+                </Text>
+              ) : step === 6 ? (
+                <View style={styles.nextBtnSubmitRow}>
+                  <Text
+                    style={[
+                      styles.nextBtnSubmitCheck,
+                      !canProceed() && styles.nextBtnSubmitMuted,
+                    ]}
+                  >
+                    ✓
+                  </Text>
+                  <Text
+                    style={[
+                      styles.nextBtnTextSubmit,
+                      !canProceed() && styles.nextBtnSubmitMuted,
+                    ]}
+                  >
+                    חשב את המאזן שלי
+                  </Text>
+                </View>
+              ) : (
+                <Text style={styles.nextBtnText}>המשך</Text>
+              )}
             </TouchableOpacity>
 
             {step === 0 && (
@@ -1331,7 +1448,13 @@ export default function Onboarding() {
             {step > 0 && (
               <TouchableOpacity
                 style={styles.backBtn}
-                onPress={() => setStep(prev => prev - 1)}
+                onPress={() => setStep(prev => {
+                  const back = prev - 1;
+                  if (back === 1 && userName.trim().length > 0) {
+                    return 0;
+                  }
+                  return back;
+                })}
               >
                 <Text style={styles.backBtnText}>← חזור</Text>
               </TouchableOpacity>
@@ -1614,7 +1737,21 @@ const styles = StyleSheet.create({
     gap: 12,
   },
   optionsScroll: {
-    maxHeight: SCREEN_HEIGHT * 0.4,
+    maxHeight: SCREEN_HEIGHT * 0.3,
+  },
+  activityNotesInput: {
+    minHeight: 56,
+    maxHeight: 100,
+    marginTop: 10,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#E2E8F0',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 15,
+    color: '#0F172A',
+    textAlign: 'right',
   },
   optionBtn: {
     flexDirection: 'row',
@@ -1720,8 +1857,33 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 3,
   },
+  nextBtnSubmit: {
+    backgroundColor: '#E8F5E8',
+    borderWidth: 1,
+    borderColor: '#C8E6C9',
+  },
+  nextBtnSubmitRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  nextBtnSubmitCheck: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#32A728',
+  },
+  nextBtnTextSubmit: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: '#32A728',
+  },
+  nextBtnSubmitMuted: {
+    color: '#64748B',
+  },
   nextBtnDisabled: {
     backgroundColor: '#CBD5E1',
+    borderColor: '#94A3B8',
   },
   nextBtnText: {
     fontSize: 17,
@@ -2060,19 +2222,16 @@ const styles = StyleSheet.create({
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: '#16A34A',
+    backgroundColor: '#E8F5E8',
+    borderWidth: 1,
+    borderColor: '#C8E6C9',
     justifyContent: 'center',
     alignItems: 'center',
-    shadowColor: '#16A34A',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
-    elevation: 3,
   },
   submitBtnText: {
     fontSize: 20,
     fontWeight: '700',
-    color: '#FFFFFF',
+    color: '#32A728',
   },
   macroEditRow: {
     flexDirection: 'row',
@@ -2094,14 +2253,16 @@ const styles = StyleSheet.create({
     width: 28,
     height: 28,
     borderRadius: 14,
-    backgroundColor: '#16A34A',
+    backgroundColor: '#E8F5E8',
+    borderWidth: 1,
+    borderColor: '#C8E6C9',
     justifyContent: 'center',
     alignItems: 'center',
   },
   macroSubmitBtnText: {
     fontSize: 14,
     fontWeight: '700',
-    color: '#FFFFFF',
+    color: '#32A728',
   },
   editInfoChip: {
     backgroundColor: '#F3F4F6',

@@ -5,10 +5,10 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  SafeAreaView,
   ActivityIndicator,
   RefreshControl,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -22,14 +22,36 @@ import Animated, {
   Easing,
   cancelAnimation,
 } from 'react-native-reanimated';
-import { LinearGradient } from 'expo-linear-gradient';
 import { useNavigation } from '@react-navigation/native';
 import { useApp } from '../context/AppContext';
-import { analyzeNutritionWithO1 } from '../api/openaiClient';
+import { analyzeNutritionWithO1 } from '../api/aiClient';
+import {
+  getDailyStatsHistory,
+  getMealsSince,
+  getWaterLogsSince,
+  getWeightLogsSince,
+} from '../api/supabaseClient';
+import { buildAiBehaviorNarrative } from '../utils/buildAiBehaviorContext';
+import SourceCitation from '../components/SourceCitation';
 import moment from 'moment';
 import 'moment/locale/he';
 
+const LOOKBACK_DAYS = 21;
+
 moment.locale('he');
+
+/** Brand green — same as caloric balance (BalanceHeader trophy / ring) */
+const BRAND = '#32A728';
+const BRAND_LIGHT = '#E8F5E8';
+const BRAND_TINT = 'rgba(50, 167, 40, 0.08)';
+const TEXT_PRIMARY = '#0F1A0E';
+const TEXT_MUTED = 'rgba(50, 167, 40, 0.55)';
+
+const CITE_PALETTE = {
+  text: TEXT_MUTED,
+  link: BRAND,
+  faint: 'rgba(50, 167, 40, 0.42)',
+};
 
 const SPRING_CONFIG = {
   damping: 20,
@@ -37,8 +59,8 @@ const SPRING_CONFIG = {
   mass: 0.8,
 };
 
-// Bouncing Dots Animation Component
-const BouncingDots = () => {
+// Bouncing Dots — dark dots on light loading row
+const BouncingDots = ({ dark }) => {
   const dot1 = useSharedValue(0);
   const dot2 = useSharedValue(0);
   const dot3 = useSharedValue(0);
@@ -97,11 +119,12 @@ const BouncingDots = () => {
     transform: [{ translateY: dot3.value }],
   }));
 
+  const dotColor = dark ? BRAND : '#FFFFFF';
   return (
     <View style={dotsStyles.container}>
-      <Animated.View style={[dotsStyles.dot, dot1Style]} />
-      <Animated.View style={[dotsStyles.dot, dot2Style]} />
-      <Animated.View style={[dotsStyles.dot, dot3Style]} />
+      <Animated.View style={[dotsStyles.dot, { backgroundColor: dotColor }, dot1Style]} />
+      <Animated.View style={[dotsStyles.dot, { backgroundColor: dotColor }, dot2Style]} />
+      <Animated.View style={[dotsStyles.dot, { backgroundColor: dotColor }, dot3Style]} />
     </View>
   );
 };
@@ -111,19 +134,18 @@ const dotsStyles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 6,
-    height: 20,
+    gap: 5,
+    height: 18,
   },
   dot: {
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: '#FFFFFF',
+    width: 6,
+    height: 6,
+    borderRadius: 3,
   },
 });
 
-// Insight Card Component
-const InsightCard = ({ title, icon, content, type, delay }) => {
+// Insight card — single neutral surface, brand accent strip (RTL: physical right)
+const InsightCard = ({ title, content, delay }) => {
   const progress = useSharedValue(0);
 
   useEffect(() => {
@@ -133,32 +155,13 @@ const InsightCard = ({ title, icon, content, type, delay }) => {
   const cardStyle = useAnimatedStyle(() => ({
     opacity: interpolate(progress.value, [0, 1], [0, 1], Extrapolate.CLAMP),
     transform: [
-      { translateY: interpolate(progress.value, [0, 1], [30, 0], Extrapolate.CLAMP) },
-      { scale: interpolate(progress.value, [0, 1], [0.95, 1], Extrapolate.CLAMP) },
+      { translateY: interpolate(progress.value, [0, 1], [16, 0], Extrapolate.CLAMP) },
     ],
   }));
 
-  const getColors = () => {
-    switch (type) {
-      case 'success': return { border: '#22C55E', bg: '#F0FDF4' };
-      case 'warning': return { border: '#F59E0B', bg: '#FFFBEB' };
-      case 'danger': return { border: '#EF4444', bg: '#FEF2F2' };
-      case 'info': return { border: '#3B82F6', bg: '#EFF6FF' };
-      case 'tip': return { border: '#8B5CF6', bg: '#F5F3FF' };
-      default: return { border: '#E5E7EB', bg: '#FFFFFF' };
-    }
-  };
-
-  const colors = getColors();
-
   return (
-    <Animated.View style={[styles.insightCard, cardStyle, { borderLeftColor: colors.border }]}>
-      <View style={styles.cardHeader}>
-        <Text style={styles.cardTitle}>{title}</Text>
-        <View style={[styles.iconBadge, { backgroundColor: colors.bg }]}>
-          <Text style={styles.cardIcon}>{icon}</Text>
-        </View>
-      </View>
+    <Animated.View style={[styles.insightCard, cardStyle]}>
+      <Text style={styles.cardTitle}>{title}</Text>
       <Text style={styles.cardContent}>{content}</Text>
     </Animated.View>
   );
@@ -183,41 +186,50 @@ const StatsSummary = ({ dailyStats, targets }) => {
   const proteinPct = Math.round(((dailyStats?.protein || 0) / (targets?.protein || 90)) * 100);
   const fatPct = Math.round(((dailyStats?.fat || 0) / (targets?.fat || 65)) * 100);
   const waterPct = Math.round(((dailyStats?.water_glasses || 0) / (targets?.water || 8)) * 100);
+  const carbT = targets?.carbs || 250;
+  const carbPct = Math.round(((dailyStats?.carbs || 0) / (carbT || 1)) * 100);
 
-  const overallScore = Math.round((Math.min(100, caloriesPct) + Math.min(100, proteinPct) + Math.min(100, fatPct) + Math.min(100, waterPct)) / 4);
-
-  const getScoreColor = () => {
-    if (overallScore >= 80) return '#22C55E';
-    if (overallScore >= 60) return '#F59E0B';
-    return '#EF4444';
-  };
+  const overallScore = Math.round(
+    (Math.min(100, caloriesPct) +
+      Math.min(100, proteinPct) +
+      Math.min(100, fatPct) +
+      Math.min(100, waterPct) +
+      Math.min(100, carbPct)) /
+      5
+  );
 
   return (
     <Animated.View style={[styles.summaryCard, cardStyle]}>
-      <View style={[styles.scoreCircle, { borderColor: getScoreColor() }]}>
-        <Text style={[styles.scoreNumber, { color: getScoreColor() }]}>{Math.min(100, overallScore)}%</Text>
-        <Text style={styles.scoreLabel}>ציון יומי</Text>
-      </View>
-      <View style={styles.statsGrid}>
+      <View style={styles.summaryInner}>
+        <View style={[styles.scoreCircle, { borderColor: BRAND }]}>
+          <View style={styles.scoreCircleInner}>
+            <Text style={[styles.scoreNumber, { color: BRAND }]}>{Math.min(100, overallScore)}%</Text>
+            <Text style={styles.scoreLabel}>היום</Text>
+          </View>
+        </View>
+        <View style={styles.statsGrid}>
         <View style={styles.statItem}>
-          <Text style={styles.statEmoji}>🔥</Text>
           <Text style={[styles.statValue, caloriesPct >= 90 && caloriesPct <= 110 && styles.statValueGood]}>{caloriesPct}%</Text>
-          <Text style={styles.statLabel}>קלוריות</Text>
+          <Text style={styles.statLabel}>קל׳</Text>
         </View>
         <View style={styles.statItem}>
-          <Text style={styles.statEmoji}>💪</Text>
           <Text style={[styles.statValue, proteinPct >= 100 && styles.statValueGood]}>{proteinPct}%</Text>
           <Text style={styles.statLabel}>חלבון</Text>
         </View>
         <View style={styles.statItem}>
-          <Text style={styles.statEmoji}>🥑</Text>
           <Text style={[styles.statValue, fatPct >= 100 && styles.statValueGood]}>{fatPct}%</Text>
           <Text style={styles.statLabel}>שומן</Text>
         </View>
         <View style={styles.statItem}>
-          <Text style={styles.statEmoji}>💧</Text>
           <Text style={[styles.statValue, waterPct >= 100 && styles.statValueGood]}>{waterPct}%</Text>
           <Text style={styles.statLabel}>מים</Text>
+        </View>
+        <View style={styles.statItem}>
+          <Text style={[styles.statValue, carbPct >= 90 && carbPct <= 110 && styles.statValueGood]}>
+            {carbPct}%
+          </Text>
+          <Text style={styles.statLabel}>פחמ׳</Text>
+        </View>
         </View>
       </View>
     </Animated.View>
@@ -226,56 +238,45 @@ const StatsSummary = ({ dailyStats, targets }) => {
 
 export default function AIInsights() {
   const navigation = useNavigation();
-  const { profile, dailyStats, meals } = useApp();
+  const { profile, dailyStats, user } = useApp();
   const [insights, setInsights] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isGenerating, setIsGenerating] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [detailedReport, setDetailedReport] = useState(null);
 
-  // Button animation
-  const buttonPulse = useSharedValue(1);
-
-  useEffect(() => {
-    buttonPulse.value = withRepeat(
-      withSequence(
-        withTiming(1.02, { duration: 1000, easing: Easing.inOut(Easing.ease) }),
-        withTiming(1, { duration: 1000, easing: Easing.inOut(Easing.ease) })
-      ),
-      -1,
-      true
-    );
-  }, []);
-
-  const buttonStyle = useAnimatedStyle(() => ({
-    transform: [{ scale: buttonPulse.value }],
-  }));
-
   // Use useMemo to prevent recreating targets on every render
   const targets = useMemo(() => ({
     calories: profile?.calories_target || 2000,
     protein: profile?.protein_target || 90,
     fat: profile?.fat_target || 65,
+    carbs: profile?.carbs_target || 250,
     water: profile?.water_target || 8,
-  }), [profile?.calories_target, profile?.protein_target, profile?.fat_target, profile?.water_target]);
+  }), [profile?.calories_target, profile?.protein_target, profile?.fat_target, profile?.carbs_target, profile?.water_target]);
 
   const generateInsights = useCallback(() => {
     const caloriesPct = Math.round(((dailyStats?.calories || 0) / targets.calories) * 100);
     const proteinPct = Math.round(((dailyStats?.protein || 0) / targets.protein) * 100);
     const fatPct = Math.round(((dailyStats?.fat || 0) / targets.fat) * 100);
     const waterPct = Math.round(((dailyStats?.water_glasses || 0) / targets.water) * 100);
+    const carbPct = Math.round(((dailyStats?.carbs || 0) / (targets.carbs || 250)) * 100);
 
     const hour = new Date().getHours();
     const newInsights = [];
 
     // Overall status
-    const overallScore = (Math.min(100, caloriesPct) + Math.min(100, proteinPct) + Math.min(100, fatPct) + Math.min(100, waterPct)) / 4;
+    const overallScore =
+      (Math.min(100, caloriesPct) +
+        Math.min(100, proteinPct) +
+        Math.min(100, fatPct) +
+        Math.min(100, waterPct) +
+        Math.min(100, carbPct)) /
+      5;
 
     if (overallScore >= 80) {
       newInsights.push({
         id: 'overall',
         title: 'הערכת מצב כללית',
-        icon: '🏆',
         content: `יום מצוין! הגעת ל-${Math.round(overallScore)}% מהיעדים. ממשיכים כך!`,
         type: 'success',
       });
@@ -283,7 +284,6 @@ export default function AIInsights() {
       newInsights.push({
         id: 'overall',
         title: 'הערכת מצב כללית',
-        icon: '📊',
         content: `אתה על ${Math.round(overallScore)}% מהיעדים. עוד קצת מאמץ ומגיעים ליעד!`,
         type: 'info',
       });
@@ -291,7 +291,6 @@ export default function AIInsights() {
       newInsights.push({
         id: 'overall',
         title: 'הערכת מצב כללית',
-        icon: '💪',
         content: `היום רק ${Math.round(overallScore)}% מהיעד. זה בסדר - כל יום הוא הזדמנות חדשה!`,
         type: 'warning',
       });
@@ -307,8 +306,7 @@ export default function AIInsights() {
     if (strengths.length > 0) {
       newInsights.push({
         id: 'strengths',
-        title: '💚 נקודות חזקות',
-        icon: '✨',
+        title: 'נקודות חזקות',
         content: `מצוין ב: ${strengths.join(', ')}. המשך לשמור על הרמה!`,
         type: 'success',
       });
@@ -323,8 +321,7 @@ export default function AIInsights() {
     if (weaknesses.length > 0) {
       newInsights.push({
         id: 'weaknesses',
-        title: '⚠️ דורש שיפור',
-        icon: '📉',
+        title: 'דורש שיפור',
         content: weaknesses.join(' | '),
         type: 'warning',
       });
@@ -334,24 +331,21 @@ export default function AIInsights() {
     if (hour >= 6 && hour < 10) {
       newInsights.push({
         id: 'tip',
-        title: '💡 טיפ לבוקר',
-        icon: '🌅',
+        title: 'טיפ לבוקר',
         content: 'ארוחת בוקר עשירה בחלבון תעזור לך להרגיש שבע יותר זמן. ביצים + לחם מלא = שילוב מנצח!',
         type: 'tip',
       });
     } else if (hour >= 14 && hour < 17) {
       newInsights.push({
         id: 'tip',
-        title: '💡 טיפ לאחה"צ',
-        icon: '☀️',
+        title: 'טיפ לאחר הצהריים',
         content: 'השעות האלה קריטיות - חופן אגוזים או פרי עדיפים על חטיפים מתוקים!',
         type: 'tip',
       });
     } else if (hour >= 20) {
       newInsights.push({
         id: 'tip',
-        title: '💡 טיפ לערב',
-        icon: '🌙',
+        title: 'טיפ לערב',
         content: 'נסה לסיים לאכול 2-3 שעות לפני השינה לעיכול טוב יותר.',
         type: 'tip',
       });
@@ -362,13 +356,33 @@ export default function AIInsights() {
     setIsRefreshing(false);
   }, [dailyStats, targets]);
 
-  // Generate detailed AI report using o1
+  // Generate detailed AI report (Gemini via proxy)
   const generateDetailedReport = async () => {
     setIsGenerating(true);
 
+    const startDate = moment().subtract(LOOKBACK_DAYS, 'days').format('YYYY-MM-DD');
+    let behaviorNarrative = '';
+    if (user?.id) {
+      const [hRes, mRes, wRes, weightRes] = await Promise.all([
+        getDailyStatsHistory(user.id, LOOKBACK_DAYS + 7),
+        getMealsSince(user.id, startDate),
+        getWaterLogsSince(user.id, startDate),
+        getWeightLogsSince(user.id, startDate),
+      ]);
+      behaviorNarrative = buildAiBehaviorNarrative({
+        profile,
+        dailyStatsHistory: hRes.data || [],
+        meals: mRes.data || [],
+        waterLogs: wRes.data || [],
+        weightLogs: weightRes.data || [],
+        lookbackDays: LOOKBACK_DAYS,
+      });
+    }
+
     try {
-      // Call o1 for advanced analysis
-      const aiResult = await analyzeNutritionWithO1(dailyStats, targets, profile);
+      const aiResult = await analyzeNutritionWithO1(dailyStats, targets, profile, {
+        behaviorNarrative,
+      });
 
       if (!aiResult.success) {
         throw new Error('AI analysis failed');
@@ -378,56 +392,60 @@ export default function AIInsights() {
       const proteinPct = Math.round(((dailyStats?.protein || 0) / targets.protein) * 100);
       const fatPct = Math.round(((dailyStats?.fat || 0) / targets.fat) * 100);
       const waterPct = Math.round(((dailyStats?.water_glasses || 0) / targets.water) * 100);
+      const carbPct = Math.round(
+        ((dailyStats?.carbs || 0) / (targets.carbs || 250)) * 100
+      );
 
       const report = {
         timestamp: aiResult.timestamp,
         overallScore: aiResult.overallScore,
         status: aiResult.status,
         recommendation: aiResult.recommendation,
-        model: aiResult.model, // 'o1' or 'fallback'
+        model: aiResult.model, // e.g. gemini-2.5-flash or 'fallback'
         mainInsight: aiResult.mainInsight,
         motivationalMessage: aiResult.motivationalMessage,
         sections: [
           {
-            title: '📊 סיכום יומי',
-            icon: '📈',
+            title: 'סיכום יומי',
+            icon: '•',
             items: [
               `ציון כללי: ${aiResult.overallScore}%`,
               `קלוריות: ${dailyStats?.calories || 0}/${targets.calories} (${caloriesPct}%)`,
               `חלבון: ${Math.round(dailyStats?.protein || 0)}g/${targets.protein}g (${proteinPct}%)`,
               `שומן: ${Math.round(dailyStats?.fat || 0)}g/${targets.fat}g (${fatPct}%)`,
+              `פחמימות: ${Math.round(dailyStats?.carbs || 0)}g/${targets.carbs}g (${carbPct}%)`,
               `מים: ${dailyStats?.water_glasses || 0}/${targets.water} כוסות (${waterPct}%)`,
             ],
           },
           {
-            title: '🧠 תובנה עיקרית',
-            icon: '💡',
+            title: 'תובנה עיקרית',
+            icon: '•',
             items: [aiResult.mainInsight],
           },
           {
-            title: '💪 נקודות חזקות',
-            icon: '✅',
+            title: 'נקודות חזקות',
+            icon: '•',
             items: aiResult.strengths?.length > 0
               ? aiResult.strengths
               : ['ממשיך לעקוב - הנתונים יתעדכנו'],
           },
           {
-            title: '🎯 תחומים לשיפור',
-            icon: '📉',
+            title: 'תחומים לשיפור',
+            icon: '•',
             items: aiResult.improvements?.length > 0
               ? aiResult.improvements
               : ['אין הערות מיוחדות - המשך כך!'],
           },
           {
-            title: '📋 פעולות מומלצות',
-            icon: '🚀',
+            title: 'פעולות מומלצות',
+            icon: '•',
             items: aiResult.actionItems?.length > 0
               ? aiResult.actionItems
               : ['המשך לתעד את הארוחות שלך'],
           },
           {
-            title: '💡 טיפ אישי',
-            icon: '🎯',
+            title: 'טיפ אישי',
+            icon: '•',
             items: [aiResult.personalizedTip],
           },
         ],
@@ -448,8 +466,8 @@ export default function AIInsights() {
         model: 'error',
         sections: [
           {
-            title: '⚠️ שגיאה',
-            icon: '❌',
+            title: 'שגיאה',
+            icon: '—',
             items: ['אירעה שגיאה בניתוח. נסה שוב מאוחר יותר.'],
           },
         ],
@@ -470,18 +488,21 @@ export default function AIInsights() {
   };
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.safe} edges={['top', 'left', 'right']}>
+      <View style={styles.container}>
       {/* Header */}
       <View style={styles.header}>
         <TouchableOpacity
           style={styles.backButton}
           onPress={() => navigation.goBack()}
+          accessibilityRole="button"
+          accessibilityLabel="חזרה"
         >
           <Text style={styles.backIcon}>→</Text>
         </TouchableOpacity>
-        <View style={styles.headerCenter}>
-          <Text style={styles.headerTitle}>🧠 AI ניתוח</Text>
-          <Text style={styles.headerSubtitle}>{moment().format('DD/MM/YYYY • HH:mm')}</Text>
+        <View pointerEvents="none" style={styles.headerCenter}>
+          <Text style={styles.headerTitle}>ניתוח AI</Text>
+          <Text style={styles.headerSubtitle}>{moment().format('DD/MM/YYYY · HH:mm')}</Text>
         </View>
         <View style={styles.headerSpacer} />
       </View>
@@ -491,83 +512,80 @@ export default function AIInsights() {
         contentContainerStyle={styles.contentContainer}
         showsVerticalScrollIndicator={false}
         refreshControl={
-          <RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} tintColor="#16A34A" />
+          <RefreshControl refreshing={isRefreshing} onRefresh={onRefresh} tintColor={BRAND} />
         }
       >
         {isLoading ? (
           <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#16A34A" />
+            <ActivityIndicator size="small" color={BRAND} />
             <Text style={styles.loadingText}>מנתח את הנתונים שלך...</Text>
           </View>
         ) : (
           <>
             {/* Stats Summary */}
             <StatsSummary dailyStats={dailyStats} targets={targets} />
+            <SourceCitation variant="compact" palette={CITE_PALETTE} />
 
-            {/* Generate Report Button */}
-            <Animated.View style={buttonStyle}>
-              <TouchableOpacity
-                style={styles.generateButton}
-                onPress={generateDetailedReport}
-                disabled={isGenerating}
-              >
-                <LinearGradient
-                  colors={isGenerating ? ['#6366F1', '#4F46E5'] : ['#16A34A', '#15803D']}
-                  style={[
-                    styles.generateButtonGradient,
-                    isGenerating && styles.generateButtonGradientLoading
-                  ]}
-                  start={{ x: 0, y: 0 }}
-                  end={{ x: 1, y: 0 }}
-                >
-                  {isGenerating ? (
-                    <View style={styles.generatingContent}>
-                      <BouncingDots />
-                      <Text style={styles.generateButtonText}>מנתח את הנתונים...</Text>
-                      <Text style={styles.generatingSubtext}>זה ניתוח מורכב, עשוי לקחת כמה שניות</Text>
-                      <Text style={styles.generatingThanks}>תודה על ההמתנה! 🙏</Text>
-                    </View>
-                  ) : (
-                    <>
-                      <Text style={styles.generateButtonIcon}>🔍</Text>
-                      <Text style={styles.generateButtonText}>צור דוח AI מפורט</Text>
-                    </>
-                  )}
-                </LinearGradient>
-              </TouchableOpacity>
-            </Animated.View>
+            <TouchableOpacity
+              style={styles.generateButtonWrap}
+              onPress={generateDetailedReport}
+              disabled={isGenerating}
+              activeOpacity={0.85}
+            >
+              {isGenerating ? (
+                <View style={[styles.generateButton, styles.generateButtonLoading]}>
+                  <View style={styles.generatingContent}>
+                    <BouncingDots dark />
+                    <Text style={styles.generateButtonTextMuted}>מנתח…</Text>
+                    <Text style={styles.generatingSubtextMuted}>מוסיף הקשר מההיסטוריה במסד</Text>
+                  </View>
+                </View>
+              ) : (
+                <View style={styles.generateButton}>
+                  <Text style={styles.generateButtonLabelLight}>דוח מפורט</Text>
+                  <Text style={styles.generateButtonHint}>היסטוריית מסד · דפוסי שעות</Text>
+                </View>
+              )}
+            </TouchableOpacity>
 
             {/* Detailed Report */}
             {detailedReport && (
               <View style={styles.reportContainer}>
                 <View style={styles.reportHeader}>
                   <Text style={styles.reportTitle}>
-                    {(detailedReport.model === 'gpt-4o' || detailedReport.model === 'o1') ? '🧠 דוח AI מתקדם' : '📋 דוח AI מפורט'}
+                    דוח
                   </Text>
-                  <View style={[
-                    styles.statusBadge,
-                    { backgroundColor: detailedReport.recommendation === 'שמירה' ? '#D1FAE5' : '#FEF3C7' }
-                  ]}>
-                    <Text style={[
-                      styles.statusText,
-                      { color: detailedReport.recommendation === 'שמירה' ? '#166534' : '#92400E' }
-                    ]}>
-                      {detailedReport.recommendation === 'שמירה' ? '✨ שמירה' : '📈 שיפור'}
+                  <View
+                    style={[
+                      styles.statusBadge,
+                      detailedReport.recommendation === 'שמירה'
+                        ? styles.statusBadgeSolid
+                        : styles.statusBadgeOutline,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.statusText,
+                        detailedReport.recommendation === 'שמירה'
+                          ? styles.statusTextOnBrand
+                          : styles.statusTextBrand,
+                      ]}
+                    >
+                      {detailedReport.recommendation === 'שמירה' ? 'שמירה' : 'שיפור'}
                     </Text>
                   </View>
                 </View>
 
-                {/* Model indicator */}
-                {(detailedReport.model === 'gpt-4o' || detailedReport.model === 'o1') && (
-                  <View style={[
-                    styles.modelBadge,
-                    detailedReport.model === 'o1' && styles.modelBadgeO1
-                  ]}>
-                    <Text style={[
-                      styles.modelBadgeText,
-                      detailedReport.model === 'o1' && styles.modelBadgeTextO1
-                    ]}>
-                      {detailedReport.model === 'o1' ? '🧠 מנותח עם OpenAI o1 (חשיבה מתקדמת)' : '⚡ מנותח עם OpenAI gpt-4o'}
+                {detailedReport.model &&
+                  detailedReport.model !== 'fallback' &&
+                  (String(detailedReport.model).includes('gemini') ||
+                    detailedReport.model === 'gpt-4o' ||
+                    detailedReport.model === 'o1') && (
+                  <View style={styles.modelBadge}>
+                    <Text style={styles.modelBadgeText}>
+                      {String(detailedReport.model).includes('gemini')
+                        ? 'Gemini'
+                        : detailedReport.model || 'LLM'}
                     </Text>
                   </View>
                 )}
@@ -584,7 +602,7 @@ export default function AIInsights() {
                     <Text style={styles.reportSectionTitle}>{section.title}</Text>
                     {section.items.map((item, idx) => (
                       <View key={idx} style={styles.reportItem}>
-                        <Text style={styles.reportBullet}>•</Text>
+                        <Text style={styles.reportBullet}>·</Text>
                         <Text style={styles.reportItemText}>{item}</Text>
                       </View>
                     ))}
@@ -592,15 +610,16 @@ export default function AIInsights() {
                 ))}
 
                 <Text style={styles.reportTimestamp}>
-                  {(detailedReport.model === 'gpt-4o' || detailedReport.model === 'o1') ? '🧠 ' : ''}נוצר ב: {moment(detailedReport.timestamp).format('DD/MM/YYYY HH:mm')}
+                  {moment(detailedReport.timestamp).format('DD/MM/YYYY · HH:mm')}
                 </Text>
+                <SourceCitation variant="ai" showDisclaimer palette={CITE_PALETTE} />
               </View>
             )}
 
             {/* Section Title */}
             <View style={styles.sectionHeader}>
-              <Text style={styles.sectionTitle}>תובנות מהירות</Text>
-              <Text style={styles.sectionSubtitle}>מבוסס על הנתונים שלך</Text>
+              <Text style={styles.sectionTitle}>תובנות</Text>
+              <Text style={styles.sectionSubtitle}>היום · נתונים מקומיים</Text>
             </View>
 
             {/* Insights Cards */}
@@ -608,9 +627,7 @@ export default function AIInsights() {
               <InsightCard
                 key={insight.id}
                 title={insight.title}
-                icon={insight.icon}
                 content={insight.content}
-                type={insight.type}
                 delay={index * 100}
               />
             ))}
@@ -618,17 +635,23 @@ export default function AIInsights() {
             {/* Footer Info */}
             <View style={styles.footer}>
               <Text style={styles.footerText}>
-                🕘 הערכת מצב יומית אוטומטית ב-21:30
+                הערכת מצב יומית 21:30
               </Text>
+              <SourceCitation variant="full" showDisclaimer palette={CITE_PALETTE} />
             </View>
           </>
         )}
       </ScrollView>
+      </View>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
+  safe: {
+    flex: 1,
+    backgroundColor: '#FFFFFF',
+  },
   container: {
     flex: 1,
     backgroundColor: '#FFFFFF',
@@ -637,47 +660,50 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
     backgroundColor: '#FFFFFF',
-    borderBottomWidth: 1,
-    borderBottomColor: '#F1F5F9',
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: BRAND_TINT,
   },
   backButton: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: '#F8FAFC',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#FFFFFF',
     justifyContent: 'center',
     alignItems: 'center',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(50, 167, 40, 0.35)',
   },
   backIcon: {
-    fontSize: 20,
-    color: '#16A34A',
+    fontSize: 16,
+    color: BRAND,
     fontWeight: '600',
   },
   headerCenter: {
     alignItems: 'center',
   },
   headerTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#16A34A',
+    fontSize: 17,
+    fontWeight: '600',
+    color: TEXT_PRIMARY,
+    letterSpacing: 0.2,
   },
   headerSubtitle: {
-    fontSize: 12,
-    color: '#9CA3AF',
-    marginTop: 2,
+    fontSize: 11,
+    color: TEXT_MUTED,
+    marginTop: 3,
   },
   headerSpacer: {
-    width: 44,
+    width: 36,
   },
   content: {
     flex: 1,
   },
   contentContainer: {
-    padding: 20,
-    paddingBottom: 40,
+    padding: 16,
+    paddingBottom: 36,
   },
   loadingContainer: {
     flex: 1,
@@ -686,159 +712,170 @@ const styles = StyleSheet.create({
     paddingTop: 100,
   },
   loadingText: {
-    marginTop: 16,
-    fontSize: 14,
-    color: '#64748B',
+    marginTop: 12,
+    fontSize: 13,
+    color: TEXT_MUTED,
   },
-  // Summary Card
   summaryCard: {
-    backgroundColor: '#FFFFFF',
-    borderRadius: 20,
-    padding: 20,
+    borderRadius: 12,
     marginBottom: 16,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.08,
-    shadowRadius: 12,
-    elevation: 4,
-    borderWidth: 1,
-    borderColor: '#F1F5F9',
+    overflow: 'hidden',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(50, 167, 40, 0.2)',
+    backgroundColor: '#FFFFFF',
+  },
+  summaryInner: {
+    padding: 18,
+    backgroundColor: '#FFFFFF',
   },
   scoreCircle: {
     alignSelf: 'center',
-    width: 100,
-    height: 100,
-    borderRadius: 50,
-    backgroundColor: '#F0FDF4',
-    borderWidth: 4,
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: BRAND_LIGHT,
+    borderWidth: 2,
+    padding: 2,
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 20,
+    marginBottom: 18,
+  },
+  scoreCircleInner: {
+    flex: 1,
+    width: '100%',
+    borderRadius: 38,
+    backgroundColor: '#FFFFFF',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   scoreNumber: {
-    fontSize: 28,
-    fontWeight: '800',
+    fontSize: 21,
+    fontWeight: '700',
   },
   scoreLabel: {
-    fontSize: 12,
-    color: '#64748B',
+    fontSize: 10,
+    color: TEXT_MUTED,
     marginTop: 2,
   },
   statsGrid: {
     flexDirection: 'row',
-    justifyContent: 'space-around',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    rowGap: 10,
+    paddingHorizontal: 0,
   },
   statItem: {
     alignItems: 'center',
-  },
-  statEmoji: {
-    fontSize: 24,
-    marginBottom: 4,
+    width: '18%',
+    minWidth: 48,
   },
   statValue: {
-    fontSize: 16,
-    fontWeight: '700',
-    color: '#1E293B',
+    fontSize: 14,
+    fontWeight: '600',
+    color: TEXT_PRIMARY,
   },
   statValueGood: {
-    color: '#22C55E',
+    color: BRAND,
   },
   statLabel: {
-    fontSize: 12,
-    color: '#64748B',
+    fontSize: 10,
+    color: TEXT_MUTED,
     marginTop: 2,
   },
-  // Generate Button
-  generateButton: {
-    marginBottom: 20,
-    borderRadius: 16,
+  generateButtonWrap: {
+    marginBottom: 16,
+    borderRadius: 10,
     overflow: 'hidden',
-    shadowColor: '#16A34A',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 6,
   },
-  generateButtonGradient: {
-    flexDirection: 'row',
+  generateButton: {
+    borderRadius: 10,
+    paddingVertical: 14,
+    paddingHorizontal: 16,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 16,
-    paddingHorizontal: 24,
-    gap: 10,
+    backgroundColor: BRAND,
   },
-  generateButtonGradientLoading: {
-    paddingVertical: 20,
-    flexDirection: 'column',
+  generateButtonLoading: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(50, 167, 40, 0.35)',
   },
-  generateButtonIcon: {
-    fontSize: 20,
-  },
-  generateButtonText: {
-    fontSize: 16,
-    fontWeight: '700',
+  generateButtonLabelLight: {
+    fontSize: 15,
+    fontWeight: '600',
     color: '#FFFFFF',
+  },
+  generateButtonHint: {
+    fontSize: 11,
+    color: 'rgba(255,255,255,0.85)',
+    marginTop: 4,
+  },
+  generateButtonTextMuted: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: TEXT_PRIMARY,
   },
   generatingContent: {
     alignItems: 'center',
     gap: 6,
   },
-  generatingSubtext: {
-    fontSize: 13,
-    color: 'rgba(255, 255, 255, 0.9)',
-    fontWeight: '500',
+  generatingSubtextMuted: {
+    fontSize: 11,
+    color: TEXT_MUTED,
     textAlign: 'center',
   },
-  generatingThanks: {
-    fontSize: 12,
-    color: 'rgba(255, 255, 255, 0.8)',
-    fontWeight: '500',
-    marginTop: 2,
-  },
-  // Report
   reportContainer: {
     backgroundColor: '#FFFFFF',
-    borderRadius: 16,
+    borderRadius: 12,
     padding: 16,
-    marginBottom: 20,
-    borderWidth: 2,
-    borderColor: '#16A34A',
-    shadowColor: '#16A34A',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 3,
+    marginBottom: 16,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(50, 167, 40, 0.2)',
   },
   reportHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    marginBottom: 16,
-    paddingBottom: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: '#E5E7EB',
+    marginBottom: 12,
+    paddingBottom: 10,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: BRAND_TINT,
   },
   reportTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1E293B',
+    fontSize: 15,
+    fontWeight: '600',
+    color: TEXT_PRIMARY,
   },
   statusBadge: {
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
     paddingVertical: 4,
-    borderRadius: 20,
+    borderRadius: 6,
+  },
+  statusBadgeSolid: {
+    backgroundColor: BRAND,
+  },
+  statusBadgeOutline: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: BRAND,
   },
   statusText: {
-    fontSize: 13,
+    fontSize: 11,
     fontWeight: '600',
   },
+  statusTextOnBrand: {
+    color: '#FFFFFF',
+  },
+  statusTextBrand: {
+    color: BRAND,
+  },
   reportSection: {
-    marginBottom: 16,
+    marginBottom: 12,
   },
   reportSectionTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: '#1E293B',
+    fontSize: 12,
+    fontWeight: '600',
+    color: BRAND,
     marginBottom: 8,
     textAlign: 'right',
   },
@@ -846,138 +883,109 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'flex-start',
     marginBottom: 6,
-    paddingRight: 4,
+    paddingRight: 2,
   },
   reportBullet: {
     fontSize: 14,
-    color: '#16A34A',
+    color: BRAND,
     marginLeft: 8,
+    marginTop: 0,
     fontWeight: '700',
   },
   reportItemText: {
-    fontSize: 14,
-    color: '#475569',
+    fontSize: 13,
+    color: TEXT_PRIMARY,
     flex: 1,
     textAlign: 'right',
     lineHeight: 20,
+    opacity: 0.92,
   },
   reportTimestamp: {
-    fontSize: 11,
-    color: '#94A3B8',
+    fontSize: 10,
+    color: TEXT_MUTED,
     textAlign: 'center',
-    marginTop: 12,
-    paddingTop: 12,
-    borderTopWidth: 1,
-    borderTopColor: '#E5E7EB',
+    marginTop: 10,
+    paddingTop: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: BRAND_TINT,
   },
   modelBadge: {
-    alignSelf: 'center',
-    backgroundColor: '#EEF2FF',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-    marginBottom: 12,
-    borderWidth: 1,
-    borderColor: '#C7D2FE',
-  },
-  modelBadgeO1: {
-    backgroundColor: '#FDF4FF',
-    borderColor: '#E879F9',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
+    alignSelf: 'flex-end',
+    backgroundColor: BRAND_LIGHT,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    marginBottom: 10,
   },
   modelBadgeText: {
-    fontSize: 12,
-    color: '#4F46E5',
+    fontSize: 10,
+    color: BRAND,
     fontWeight: '600',
-  },
-  modelBadgeTextO1: {
-    color: '#A21CAF',
-    fontWeight: '700',
   },
   motivationalBox: {
-    backgroundColor: '#F0FDF4',
-    borderRadius: 12,
-    padding: 14,
-    marginBottom: 16,
-    borderWidth: 1,
-    borderColor: '#BBF7D0',
+    backgroundColor: BRAND_LIGHT,
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 12,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: 'rgba(50, 167, 40, 0.15)',
   },
   motivationalText: {
-    fontSize: 15,
-    color: '#166534',
-    fontWeight: '600',
+    fontSize: 13,
+    color: TEXT_PRIMARY,
+    fontWeight: '500',
     textAlign: 'center',
-    lineHeight: 22,
+    lineHeight: 20,
   },
-  // Section
   sectionHeader: {
-    marginBottom: 16,
+    marginBottom: 14,
+    marginTop: 6,
   },
   sectionTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#1E293B',
+    fontSize: 15,
+    fontWeight: '600',
+    color: TEXT_PRIMARY,
     textAlign: 'right',
   },
   sectionSubtitle: {
-    fontSize: 13,
-    color: '#64748B',
+    fontSize: 12,
+    color: TEXT_MUTED,
     textAlign: 'right',
-    marginTop: 2,
+    marginTop: 4,
   },
-  // Insight Card
   insightCard: {
+    borderRadius: 10,
+    padding: 14,
+    marginBottom: 10,
+    borderRightWidth: 3,
+    borderRightColor: BRAND,
     backgroundColor: '#FFFFFF',
-    borderRadius: 16,
-    padding: 16,
-    marginBottom: 12,
-    borderLeftWidth: 4,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.05,
-    shadowRadius: 8,
-    elevation: 2,
-  },
-  cardHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'flex-end',
-    marginBottom: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: BRAND_TINT,
   },
   cardTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: '#1E293B',
+    fontSize: 13,
+    fontWeight: '600',
+    color: BRAND,
     textAlign: 'right',
-  },
-  iconBadge: {
-    width: 32,
-    height: 32,
-    borderRadius: 10,
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginLeft: 10,
-  },
-  cardIcon: {
-    fontSize: 18,
+    marginBottom: 6,
   },
   cardContent: {
-    fontSize: 14,
-    lineHeight: 22,
-    color: '#475569',
+    fontSize: 13,
+    lineHeight: 20,
+    color: TEXT_PRIMARY,
     textAlign: 'right',
+    opacity: 0.9,
   },
-  // Footer
   footer: {
-    marginTop: 20,
-    padding: 16,
-    backgroundColor: '#F8FAFC',
-    borderRadius: 12,
+    marginTop: 8,
+    paddingVertical: 16,
+    paddingHorizontal: 4,
     alignItems: 'center',
   },
   footerText: {
-    fontSize: 13,
-    color: '#64748B',
+    fontSize: 11,
+    color: TEXT_MUTED,
+    marginBottom: 4,
   },
 });

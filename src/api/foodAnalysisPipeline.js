@@ -16,18 +16,16 @@
  */
 
 import { supabase } from './supabaseClient';
-import { 
-  generateReferencePrompt, 
+import { callGemini } from './geminiClient';
+import {
+  generateReferencePrompt,
   findClosestPortion,
-  getFoodDensity 
+  getFoodDensity
 } from './referenceWeights';
 
-// ============================================================
-// Configuration
-// ============================================================
-
-const OPENAI_API_KEY = process.env.EXPO_PUBLIC_OPENAI_API_KEY || '';
-const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+const devLog = (...args) => {
+  if (__DEV__) console.log(...args);
+};
 
 // ============================================================
 // STAGE A: The Eyes (AI Vision)
@@ -43,7 +41,7 @@ const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
  * @returns {Promise<VisionResult>}
  */
 export async function stageA_Vision(imagesBase64) {
-  console.log('🔍 Stage A: AI Vision Analysis...');
+  devLog('🔍 Stage A: AI Vision Analysis...');
 
   const imageContents = imagesBase64.map((img, index) => ({
     type: 'image_url',
@@ -133,39 +131,20 @@ ${referencesPrompt}
 
 
   try {
-    const response = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              ...imageContents
-            ]
-          }
-        ],
-        max_tokens: 1500,
-        temperature: 0.2,
-        response_format: { type: "json_object" },
-      }),
-    });
+    const content = await callGemini(
+      [
+        {
+          role: 'user',
+          content: [{ type: 'text', text: prompt }, ...imageContents],
+        },
+      ],
+      { temperature: 0.2, maxTokens: 1500, responseMimeType: 'application/json' },
+    );
 
-    if (!response.ok) {
-      throw new Error(`Vision API error: ${response.status}`);
-    }
+    devLog('   Vision response:', content?.substring?.(0, 200));
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
-    
-    console.log('   Vision response:', content);
-
-    const parsed = JSON.parse(content);
+    const clean = String(content).replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const parsed = JSON.parse(clean.match(/\{[\s\S]*\}/)?.[0] || clean);
     
     return {
       success: true,
@@ -198,7 +177,7 @@ ${referencesPrompt}
  * @returns {object} Calibrated weight
  */
 export function stageA5_WeightCalibration(item) {
-  console.log(`⚖️  Stage A.5: Calibrating weight for "${item.name_he}"...`);
+  devLog(`⚖️  Stage A.5: Calibrating weight for "${item.name_he}"...`);
 
   const originalGrams = item.estimated_grams;
   const standardPortion = findClosestPortion(item.name_he, originalGrams);
@@ -209,9 +188,9 @@ export function stageA5_WeightCalibration(item) {
 
     // If difference is significant (>20%), suggest correction
     if (diffPercent > 20) {
-      console.log(`   ⚠️  Large difference detected: ${diffPercent.toFixed(0)}%`);
-      console.log(`   Original: ${originalGrams}g → Suggested: ${standardPortion.suggestedGrams}g`);
-      console.log(`   Reason: ${standardPortion.description}`);
+      devLog(`   ⚠️  Large difference detected: ${diffPercent.toFixed(0)}%`);
+      devLog(`   Original: ${originalGrams}g → Suggested: ${standardPortion.suggestedGrams}g`);
+      devLog(`   Reason: ${standardPortion.description}`);
 
       // Use weighted average: 70% standard + 30% AI estimate
       const calibratedGrams = Math.round(
@@ -230,7 +209,7 @@ export function stageA5_WeightCalibration(item) {
   }
 
   // No adjustment needed
-  console.log(`   ✅ Weight looks good: ${originalGrams}g`);
+  devLog(`   ✅ Weight looks good: ${originalGrams}g`);
   return {
     originalGrams,
     calibratedGrams: originalGrams,
@@ -253,7 +232,7 @@ export function stageA5_WeightCalibration(item) {
  * @returns {Promise<LookupResult>}
  */
 export async function stageB_Lookup(foodNameHe, foodNameEn) {
-  console.log(`📚 Stage B: Database Lookup for "${foodNameHe}" / "${foodNameEn}"...`);
+  devLog(`📚 Stage B: Database Lookup for "${foodNameHe}" / "${foodNameEn}"...`);
 
   try {
     // Try Hebrew search first (Israeli MOH priority)
@@ -270,7 +249,7 @@ export async function stageB_Lookup(foodNameHe, foodNameEn) {
     }
 
     if (result) {
-      console.log(`   ✅ Found in ${result.source}: ${result.food_name}`);
+      devLog(`   ✅ Found in ${result.source}: ${result.food_name}`);
       return {
         found: true,
         source: result.source,
@@ -283,7 +262,7 @@ export async function stageB_Lookup(foodNameHe, foodNameEn) {
       };
     }
 
-    console.log('   ❌ Not found in database');
+    devLog('   ❌ Not found in database');
     return { found: false };
 
   } catch (error) {
@@ -352,7 +331,7 @@ async function fuzzySearchNutritionDatabase(hebrewName, englishName) {
  * @returns {CalculatedResult}
  */
 export function stageC_Calculate(nutritionData, estimatedGrams) {
-  console.log(`🔢 Stage C: Calculating for ${estimatedGrams}g...`);
+  devLog(`🔢 Stage C: Calculating for ${estimatedGrams}g...`);
 
   if (!nutritionData.found) {
     return {
@@ -383,7 +362,7 @@ export function stageC_Calculate(nutritionData, estimatedGrams) {
     }
   };
 
-  console.log(`   ✅ Calculated: ${result.calories} kcal, ${result.protein}g protein`);
+  devLog(`   ✅ Calculated: ${result.calories} kcal, ${result.protein}g protein`);
   return result;
 }
 
@@ -401,7 +380,7 @@ export function stageC_Calculate(nutritionData, estimatedGrams) {
  * @returns {Promise<SanityCheckResult>}
  */
 export async function stageD_SanityCheck(imageBase64, calculatedData) {
-  console.log('✅ Stage D: Sanity Check...');
+  devLog('✅ Stage D: Sanity Check...');
 
   const prompt = `אתה מבצע ביקורת איכות על ניתוח מזון.
 
@@ -429,44 +408,26 @@ export async function stageD_SanityCheck(imageBase64, calculatedData) {
 }`;
 
   try {
-    const response = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: prompt },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/jpeg;base64,${imageBase64}`,
-                  detail: 'low'
-                }
-              }
-            ]
-          }
-        ],
-        max_tokens: 500,
-        temperature: 0.1,
-        response_format: { type: "json_object" },
-      }),
-    });
+    const content = await callGemini(
+      [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: prompt },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/jpeg;base64,${imageBase64}` },
+            },
+          ],
+        },
+      ],
+      { temperature: 0.1, maxTokens: 500, responseMimeType: 'application/json' },
+    );
 
-    if (!response.ok) {
-      throw new Error(`Sanity check API error: ${response.status}`);
-    }
+    const clean = String(content).replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const parsed = JSON.parse(clean.match(/\{[\s\S]*\}/)?.[0] || clean);
 
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
-    const parsed = JSON.parse(content);
-
-    console.log(`   Verification: ${parsed.verification}`);
+    devLog(`   Verification: ${parsed.verification}`);
 
     return {
       success: true,
@@ -500,7 +461,7 @@ export async function stageD_SanityCheck(imageBase64, calculatedData) {
  * @returns {Promise<FallbackResult>}
  */
 export async function aiEstimateFallback(foodName, estimatedGrams) {
-  console.log(`🤖 AI Fallback: Estimating nutrition for "${foodName}"...`);
+  devLog(`🤖 AI Fallback: Estimating nutrition for "${foodName}"...`);
 
   const prompt = `אתה תזונאי מומחה. הערך את הערכים התזונתיים למזון הבא:
 
@@ -520,28 +481,14 @@ export async function aiEstimateFallback(foodName, estimatedGrams) {
 בסס את ההערכה על ידע כללי. היה שמרני בהערכות.`;
 
   try {
-    const response = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 300,
-        temperature: 0.2,
-        response_format: { type: "json_object" },
-      }),
+    const content = await callGemini([{ role: 'user', content: prompt }], {
+      temperature: 0.2,
+      maxTokens: 300,
+      responseMimeType: 'application/json',
     });
 
-    if (!response.ok) {
-      throw new Error(`AI fallback error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
-    const parsed = JSON.parse(content);
+    const clean = String(content).replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const parsed = JSON.parse(clean.match(/\{[\s\S]*\}/)?.[0] || clean);
 
     return {
       success: true,
@@ -576,9 +523,9 @@ export async function aiEstimateFallback(foodName, estimatedGrams) {
  * @returns {Promise<PipelineResult>}
  */
 export async function analyzeFoodPipeline(imagesBase64) {
-  console.log('\n============================================================');
-  console.log('🍽️  BioBalance Food Analysis Pipeline');
-  console.log('============================================================\n');
+  devLog('\n============================================================');
+  devLog('🍽️  BioBalance Food Analysis Pipeline');
+  devLog('============================================================\n');
 
   const startTime = Date.now();
   const results = {
@@ -605,14 +552,14 @@ export async function analyzeFoodPipeline(imagesBase64) {
 
     // Process each identified food item
     for (const item of visionResult.items) {
-      console.log(`\n--- Processing: ${item.name_he} ---`);
+      devLog(`\n--- Processing: ${item.name_he} ---`);
 
       // ========== STAGE A.5: Weight Calibration ==========
       const calibration = stageA5_WeightCalibration(item);
       const adjustedGrams = calibration.calibratedGrams;
       
       if (calibration.wasAdjusted) {
-        console.log(`   🔧 Weight adjusted: ${item.estimated_grams}g → ${adjustedGrams}g`);
+        devLog(`   🔧 Weight adjusted: ${item.estimated_grams}g → ${adjustedGrams}g`);
       }
 
       // ========== STAGE B: Lookup ==========
@@ -665,7 +612,7 @@ export async function analyzeFoodPipeline(imagesBase64) {
 
       // Apply weight adjustment if needed
       if (!sanityResult.approved && sanityResult.weightAdjustment) {
-        console.log(`\n⚠️  Applying weight adjustment: ${sanityResult.weightAdjustment}x`);
+        devLog(`\n⚠️  Applying weight adjustment: ${sanityResult.weightAdjustment}x`);
         const adjustment = sanityResult.weightAdjustment;
         
         // Recalculate totals
@@ -688,7 +635,7 @@ export async function analyzeFoodPipeline(imagesBase64) {
     }
 
     const duration = Date.now() - startTime;
-    console.log(`\n✅ Pipeline complete in ${duration}ms`);
+    devLog(`\n✅ Pipeline complete in ${duration}ms`);
 
     return {
       success: true,

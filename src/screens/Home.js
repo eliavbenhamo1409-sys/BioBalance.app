@@ -8,7 +8,6 @@ import {
   TouchableOpacity,
   KeyboardAvoidingView,
   Platform,
-  SafeAreaView,
   Alert,
   Keyboard,
   Dimensions,
@@ -16,6 +15,7 @@ import {
   Pressable,
   Image,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 // Preload menu hero image
 const MENU_HERO_IMAGE = require('../../assets/hero2.jpg');
@@ -40,8 +40,25 @@ import Animated, {
   Easing
 } from 'react-native-reanimated';
 import { base44 } from '../api/base44Client';
-import { chatWithBot, analyzeFoodFromImage, parseFoodFromText, estimate3DWeight } from '../api/openaiClient';
+import { chatWithBot, analyzeFoodFromImage, parseFoodFromText, estimate3DWeight } from '../api/aiClient';
 import { processUserMessage, INTENTS, getGreeting, getSmartFollowUp } from '../api/smartChatbot';
+import { prefillAskQuantityHints } from '../api/chatFoodResolver';
+import {
+  attachPortionGuesses,
+  buildPortionConfirmIntro,
+  defaultTotalGramsForFood,
+} from '../utils/standardPortionGuess';
+import PortionConfirmCard from '../components/chat/PortionConfirmCard';
+import { userMessageImpliesFoodQuantity } from '../utils/userMessageQuantityHints';
+import { getDailyUsage, RateLimitError } from '../api/geminiClient';
+import { askBrachotAssistant } from '../api/brachotAssistant';
+import {
+  buildMealPlan,
+  swapMeal,
+  enforceOvershootGuard,
+  buildPlanIntro,
+} from '../api/smartMealPlanner';
+import useNotifications from '../hooks/useNotifications';
 import { useApp } from '../context/AppContext';
 import ChatMessage from '../components/chat/ChatMessage';
 import TypingIndicator from '../components/chat/TypingIndicator';
@@ -49,6 +66,9 @@ import FoodCard from '../components/chat/FoodCard';
 import RecipeCard from '../components/chat/RecipeCard';
 import RecipeSaveBanner from '../components/chat/RecipeSaveBanner';
 import InputBar from '../components/chat/InputBar';
+import BrachotAskModal from '../components/chat/BrachotAskModal';
+import { SHOW_CHAT_CAMERA_CAPTURE_IN_UI } from '../constants/featureFlags';
+import GrayIconChip from '../components/chat/GrayIconChip';
 import FoodRecognitionModal from '../components/food/FoodRecognitionModal';
 import Multi3DCapture from '../components/food/Multi3DCapture';
 import SideMenu from '../components/SideMenu';
@@ -61,6 +81,19 @@ import moment from 'moment';
 import 'moment/locale/he';
 
 moment.locale('he');
+
+/** כפתור «ברכה אחרונה» אחרי ייעוץ מה לברך — ניווט למסך עם הטקסט המתאים */
+const BRACHOT_AFTER_NAV = {
+  hamazon: { label: 'לברכת המזון', prayer: 'hamazon' },
+  mein: { label: 'למעין שלוש', prayer: 'mein' },
+  michya: { label: 'על המחיה', prayer: 'michya' },
+  short: { label: 'בורא נפשות', prayer: 'short' },
+};
+
+const _log = console.log.bind(console);
+const devLog = (...args) => {
+  if (__DEV__) _log(...args);
+};
 
 const { height: SCREEN_HEIGHT, width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -140,7 +173,10 @@ const SPRING_CONFIG = {
 export default function Home() {
   const navigation = useNavigation();
   const scrollViewRef = useRef(null);
-  const { profile, dailyStats, setDailyStats, messages, addMessage, clearMessages, today, isLoading, addWater: contextAddWater, hasCompletedOnboarding, user, addMeal } = useApp();
+  const { profile, dailyStats, setDailyStats, messages, addMessage, setMessages, clearMessages, today, isLoading, addWater: contextAddWater, hasCompletedOnboarding, user, addMeal } = useApp();
+  // Inactivity-nudge wiring: every meal log calls `updateLastFoodLog`,
+  // which also re-arms the 3.5h schedule.
+  const { updateLastFoodLog } = useNotifications();
 
   const [inputText, setInputText] = useState('');
   const [isTyping, setIsTyping] = useState(false);
@@ -150,6 +186,8 @@ export default function Home() {
   const hasGreetedRef = useRef(false);
   const [conversationHistory, setConversationHistory] = useState([]);
   const [pendingFoods, setPendingFoods] = useState([]); // Foods waiting for quantity
+  /** bot message ids for `portion_confirm` cards already submitted */
+  const [appliedPortionIds, setAppliedPortionIds] = useState({});
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [showConfetti, setShowConfetti] = useState(false);
   const [celebratedGoals, setCelebratedGoals] = useState({});
@@ -160,12 +198,79 @@ export default function Home() {
   const [isHeaderCollapsed, setIsHeaderCollapsed] = useState(true); // Start collapsed
   const [showImageModal, setShowImageModal] = useState(false);
   const [dailyMealPlan, setDailyMealPlan] = useState(null);
+  /** Syncs meal-plan swaps with chat message data + render source of truth */
+  const mealPlanMsgIdRef = useRef(null);
   const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
   const [keyboardHeight, setKeyboardHeight] = useState(0);
   const [show3DModal, setShow3DModal] = useState(false);
+  const [showBrachotAskModal, setShowBrachotAskModal] = useState(false);
   const [is3DAnalyzing, setIs3DAnalyzing] = useState(false);
   const [showConfirmButtons, setShowConfirmButtons] = useState(false); // כפתורי אישור לאחר זיהוי
 
+  // ================================================
+  // API SAFETY / RATE LIMIT STATE
+  // ================================================
+  // Guards against the runaway-retry cost blow-up:
+  //  - cooldownUntilMs: button disabled until this timestamp (ms).
+  //  - consecutiveErrors: 2 failures in a row -> long cooldown (circuit breaker).
+  //  - rateLimited: true when the server returned a 429 (exhausted daily quota).
+  //  - dailyUsage: {used, limit} for the "X left today" banner.
+  const COOLDOWN_MS_AFTER_ERROR = 8000;       // 8s after a single failure
+  const COOLDOWN_MS_CIRCUIT = 60000;           // 60s after 2 consecutive failures
+  const COOLDOWN_MS_RATE_LIMITED = 60 * 60 * 1000; // 1h lock after 429 (server will still reject)
+  const ERROR_THRESHOLD_CIRCUIT = 2;
+  // Keep in lock-step with the Edge Function secret DAILY_MESSAGE_LIMIT (default 60).
+  const DAILY_LIMIT = Number(process.env.EXPO_PUBLIC_DAILY_MESSAGE_LIMIT ?? 60) || 60;
+  const [cooldownUntilMs, setCooldownUntilMs] = useState(0);
+  const [consecutiveErrors, setConsecutiveErrors] = useState(0);
+  const [rateLimited, setRateLimited] = useState(false);
+  const [dailyUsage, setDailyUsage] = useState(null); // { used, limit } | null
+  const [nowTick, setNowTick] = useState(Date.now()); // drives countdown re-render
+
+  // Load current daily usage on mount / when user changes
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      if (!user?.id) return;
+      const result = await getDailyUsage();
+      if (!cancelled && result) {
+        setDailyUsage((prev) => ({
+          used: result.used,
+          limit: prev?.limit ?? DAILY_LIMIT,
+        }));
+      }
+    };
+    load();
+    return () => { cancelled = true; };
+  }, [user?.id]);
+
+  // Tick every second while a cooldown is active so the countdown updates
+  useEffect(() => {
+    if (cooldownUntilMs <= Date.now()) return;
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [cooldownUntilMs]);
+
+  const cooldownRemainingSec = Math.max(0, Math.ceil((cooldownUntilMs - nowTick) / 1000));
+  const isCooldownActive = cooldownRemainingSec > 0;
+
+  const inputBarReason = rateLimited
+    ? `הגעת למכסת ההודעות היומית (${dailyUsage?.limit ?? DAILY_LIMIT}). נסה שוב מחר 🌙`
+    : isCooldownActive
+      ? (consecutiveErrors >= ERROR_THRESHOLD_CIRCUIT
+          ? `בודק חיבור... ${cooldownRemainingSec}ש׳`
+          : `רגע, ${cooldownRemainingSec}ש׳ לניסיון הבא`)
+      : '';
+
+  const inputBarDisabled = rateLimited || isCooldownActive;
+  const [chatGenAbortable, setChatGenAbortable] = useState(false);
+  const chatGenAbortRef = useRef(null);
+
+  const quotaLimit = dailyUsage?.limit ?? DAILY_LIMIT;
+  const quotaUsed = dailyUsage?.used ?? 0;
+  const quotaRemaining = Math.max(0, quotaLimit - quotaUsed);
+  const showQuotaWarningBanner =
+    !!user?.id && dailyUsage != null && quotaRemaining > 0 && quotaRemaining <= 3;
 
 
   // ================================================
@@ -190,17 +295,19 @@ export default function Home() {
           ? moment().subtract(1, 'day').format('YYYY-MM-DD')
           : moment().format('YYYY-MM-DD');
         
-        console.log('[Home] Chat date check - saved:', savedDate, 'effective:', effectiveDate);
+        devLog('[Home] Chat date check - saved:', savedDate, 'effective:', effectiveDate);
         
         if (savedDate !== effectiveDate) {
           // New day (past 3 AM) - reset chat
-          console.log('[Home] New day detected - resetting chat');
+          devLog('[Home] New day detected - resetting chat');
           await clearMessagesRef.current();
           setPendingFoods([]);
           setPendingRecipe(null);
           setShowConfirmButtons(false);
           hasGreetedRef.current = false;
           setConversationHistory([]);
+          setDailyMealPlan(null);
+          mealPlanMsgIdRef.current = null;
           await AsyncStorage.setItem(CHAT_DATE_KEY, effectiveDate);
         }
       } catch (error) {
@@ -250,7 +357,7 @@ export default function Home() {
           setCelebratedGoals(todayGoals);
         }
       } catch (e) {
-        console.log('Error loading celebrated goals:', e);
+        devLog('Error loading celebrated goals:', e);
       }
     };
     loadCelebratedGoals();
@@ -264,7 +371,7 @@ export default function Home() {
           await AsyncStorage.setItem('celebrated_goals', JSON.stringify(celebratedGoals));
         }
       } catch (e) {
-        console.log('Error saving celebrated goals:', e);
+        devLog('Error saving celebrated goals:', e);
       }
     };
     saveCelebratedGoals();
@@ -341,6 +448,56 @@ export default function Home() {
       easing: Easing.bezier(0.25, 0.1, 0.25, 1)
     });
   }, [isHeaderCollapsed]);
+
+  const handleOpenBrachot = useCallback(() => {
+    collapseHeader();
+    setShowBrachotAskModal(true);
+  }, [collapseHeader]);
+
+  const handleOpenBirkatFromBrachotModal = useCallback(() => {
+    setShowBrachotAskModal(false);
+    navigation.navigate('BirkatHamazon');
+  }, [navigation]);
+
+  const handleBrachotSubmit = useCallback(
+    (q) => {
+      setShowBrachotAskModal(false);
+      addUserMessage(`מה לברך: ${q}`);
+      setIsTyping(true);
+      (async () => {
+        try {
+          const { reply, afterBlessing, before, after, note } = await askBrachotAssistant(q);
+          const uniqueId = `bot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+          const navigable = afterBlessing && afterBlessing !== 'none';
+          const b = String(before || '').trim();
+          const a = String(after || '').trim();
+          const n = String(note || '').trim();
+          const hasStructured = Boolean(b || a || n);
+          const useBrachotAdvice = navigable || hasStructured;
+          addMessage({
+            text: reply,
+            isBot: true,
+            id: uniqueId,
+            type: useBrachotAdvice ? 'brachot_advice' : 'text',
+            data: {
+              ...(navigable ? { afterBlessing } : {}),
+              ...(hasStructured ? { before: b, after: a, note: n } : {}),
+            },
+          });
+          setConversationHistory((prev) => [...prev, { role: 'assistant', content: reply }]);
+        } catch (e) {
+          if (e instanceof RateLimitError) {
+            Alert.alert('מכסה יומית', e.message || 'הגעת למגבלה. נסה שוב מחר.');
+          } else {
+            Alert.alert('שגיאה', e?.message || 'לא הצלחנו לקבל תשובה. נסה שוב.');
+          }
+        } finally {
+          setIsTyping(false);
+        }
+      })();
+    },
+    [addMessage, addUserMessage, setConversationHistory],
+  );
 
   const expandHeader = useCallback(() => {
     if (!isHeaderCollapsed) return;
@@ -569,7 +726,7 @@ export default function Home() {
 
       return `${hebrewDay} ${month} ${hebrewYear}`;
     } catch (e) {
-      console.log('Hebrew date error:', e);
+      devLog('Hebrew date error:', e);
       return '';
     }
   };
@@ -664,16 +821,19 @@ export default function Home() {
   };
 
   // Process foods that are ready (have all nutritional data)
-  const processReadyFood = async (foods) => {
-    console.log('[Home] processReadyFood called with:', foods);
+  const processReadyFood = async (foods, batchMeta = {}) => {
+    const { meal_group_id, source_message_text } = batchMeta;
+    devLog('[Home] processReadyFood called with:', foods, batchMeta);
     let totalCalories = 0;
     let totalProtein = 0;
     let totalFat = 0;
+    let totalCarbs = 0;
 
     for (const food of foods) {
       totalCalories += food.calories || 0;
       totalProtein += food.protein || 0;
       totalFat += food.fat || 0;
+      totalCarbs += food.carbs || 0;
     }
 
     // Step 1: Bot encouragement message
@@ -682,20 +842,34 @@ export default function Home() {
 
     // Step 2: Update balance (stay collapsed - animations happen in mini rings)
     setTimeout(async () => {
-      const newStats = await updateBalanceWithoutGoalCheck(totalCalories, totalProtein, totalFat);
+      const newStats = await updateBalanceWithoutGoalCheck(
+        totalCalories,
+        totalProtein,
+        totalFat,
+        null,
+        totalCarbs
+      );
       
       // Step 3: Save each food as a meal to the database (skip stats update - already done above)
-      console.log('[Home] processReadyFood: Saving', foods.length, 'meals');
+      devLog('[Home] processReadyFood: Saving', foods.length, 'meals');
       for (const food of foods) {
-        console.log('[Home] processReadyFood: Calling addMeal for:', food.name);
+        devLog('[Home] processReadyFood: Calling addMeal for:', food.name);
         await addMeal({
           name: food.name || 'ארוחה',
           calories: food.calories || 0,
           protein: food.protein || 0,
           fat: food.fat || 0,
+          carbs: food.carbs || 0,
+          source: 'chat',
+          nutrition_metadata: food.nutrition_metadata || null,
+          meal_group_id: meal_group_id ?? null,
+          source_message_text: source_message_text ?? null,
         }, true); // skipStatsUpdate = true
       }
-      console.log('[Home] processReadyFood: Done saving meals');
+      devLog('[Home] processReadyFood: Done saving meals');
+
+      // Reset the inactivity nudge timer.
+      updateLastFoodLog();
 
       // Wait a moment then check goals
       setTimeout(() => {
@@ -717,322 +891,43 @@ export default function Home() {
   // ============================================
   // DAILY MEAL PLAN FEATURE
   // ============================================
-  
-  // Generate AI-powered meal plan with accurate nutritional data
-  const generateAIMealPlan = async (remaining, goal, currentHour, userName) => {
-    const goalText = goal === 'cut' ? 'ירידה במשקל/חיטוב' 
-                   : goal === 'bulk' ? 'עלייה במסה/בניית שריר'
-                   : goal === 'lean_bulk' ? 'עלייה מתונה במסה'
-                   : 'שמירה על משקל';
-    
-    const prompt = `אתה תזונאי מקצועי. בנה תפריט מפורט לשארית היום.
+  // Planning + swap logic lives in `src/api/smartMealPlanner.js`.
+  // This screen is just orchestration: build a plan, drop it into the
+  // chat, and respect the realistic-cap message when the planner says
+  // we shouldn't try to close the entire daily gap at this hour.
 
-📊 נתונים:
-- שעה נוכחית: ${currentHour}:00
-- קלוריות שנותרו: ${remaining.calories}
-- חלבון שנותר: ${Math.round(remaining.protein)}g
-- שומן שנותר: ${Math.round(remaining.fat)}g
-- מטרה: ${goalText}
-
-📋 הנחיות:
-1. חלק את הקלוריות בין הארוחות הנותרות להיום
-2. ${goal === 'bulk' ? 'תן ארוחות צפופות בקלוריות וחלבון' : goal === 'cut' ? 'תן ארוחות משביעות ודלות קלוריות' : 'תן ארוחות מאוזנות'}
-3. הוסף נשנושים בין הארוחות (פירות, חטיפי חלבון, אגוזים)
-4. תן ערכים תזונתיים מדויקים לכל מרכיב
-
-החזר JSON בלבד בפורמט הבא:
-{
-  "meals": [
-    {
-      "time": "17:00",
-      "type": "afternoon_snack",
-      "name": "נשנוש חלבון",
-      "items": [
-        { "food": "חטיף חלבון", "amount": "1 יחידה (60g)", "calories": 200, "protein": 20, "fat": 6 },
-        { "food": "תפוח", "amount": "1 בינוני (180g)", "calories": 95, "protein": 0, "fat": 0 }
-      ],
-      "totalCalories": 295,
-      "totalProtein": 20,
-      "totalFat": 6
-    },
-    {
-      "time": "19:30",
-      "type": "dinner",
-      "name": "ארוחת ערב מאוזנת",
-      "items": [
-        { "food": "חזה עוף צלוי", "amount": "200g", "calories": 330, "protein": 62, "fat": 7 },
-        { "food": "אורז לבן מבושל", "amount": "200g", "calories": 260, "protein": 5, "fat": 1 },
-        { "food": "ברוקולי מאודה", "amount": "150g", "calories": 50, "protein": 4, "fat": 1 }
-      ],
-      "totalCalories": 640,
-      "totalProtein": 71,
-      "totalFat": 9
-    }
-  ]
-}
-
-חשוב: 
-- השתמש בערכים תזונתיים מדויקים (USDA)
-- סה"כ הקלוריות צריך להתקרב ל-${remaining.calories}
-- type יכול להיות: breakfast, morning_snack, lunch, afternoon_snack, dinner, evening_snack`;
-
-    try {
-      const result = await processUserMessage(prompt, {
-        conversationHistory: [],
-        pendingAction: null,
-        dailyStats: dailyStats || {},
-        targets: targets || {},
-        goal: goal,
-        userName: userName,
-      });
-      
-      // Try to extract JSON from response
-      if (result.response) {
-        const jsonMatch = result.response.match(/\{[\s\S]*"meals"[\s\S]*\}/);
-        if (jsonMatch) {
-          try {
-            const parsed = JSON.parse(jsonMatch[0]);
-            if (parsed.meals && parsed.meals.length > 0) {
-              return parsed;
-            }
-          } catch (e) {
-            console.log('JSON parse failed, using fallback');
-          }
-        }
-      }
-      
-      // Fallback to local builder if AI fails
-      return buildMealPlanFallback(remaining, goal, currentHour);
-    } catch (error) {
-      console.error('AI meal plan error:', error);
-      return buildMealPlanFallback(remaining, goal, currentHour);
-    }
-  };
-  
-  // Fallback meal plan builder - USES ALL REMAINING CALORIES
-  const buildMealPlanFallback = (remaining, goal, currentHour) => {
-    const meals = [];
-    const totalCalories = remaining.calories;
-    
-    console.log(`[MealPlan] Building plan for ${totalCalories} remaining calories, hour: ${currentHour}, goal: ${goal}`);
-    
-    // Define ALL possible meal slots from current hour until end of day
-    const allSlots = [
-      { hour: 7, type: 'breakfast', isMain: true },
-      { hour: 10, type: 'morning_snack', isMain: false },
-      { hour: 13, type: 'lunch', isMain: true },
-      { hour: 16, type: 'afternoon_snack', isMain: false },
-      { hour: 19, type: 'dinner', isMain: true },
-      { hour: 21, type: 'evening_snack', isMain: false },
-    ];
-    
-    // Filter slots that are still available (hour >= currentHour)
-    let availableSlots = allSlots.filter(s => s.hour >= currentHour);
-    
-    // If no slots available or it's very late, create 1-2 meals
-    if (availableSlots.length === 0) {
-      availableSlots = [
-        { hour: Math.min(currentHour + 1, 23), type: 'dinner', isMain: true },
-      ];
-      if (totalCalories > 800) {
-        availableSlots.push({ hour: Math.min(currentHour + 2, 23), type: 'evening_snack', isMain: false });
-      }
-    }
-    
-    // Count main meals and snacks
-    const mainMeals = availableSlots.filter(s => s.isMain);
-    const snacks = availableSlots.filter(s => !s.isMain);
-    
-    // Distribute calories: 75% to main meals, 25% to snacks
-    const mainMealCalories = mainMeals.length > 0 ? Math.round((totalCalories * 0.75) / mainMeals.length) : 0;
-    const snackCalories = snacks.length > 0 ? Math.round((totalCalories * 0.25) / snacks.length) : 0;
-    
-    // If no snacks, give all to main meals
-    const adjustedMainCal = snacks.length === 0 ? Math.round(totalCalories / mainMeals.length) : mainMealCalories;
-    
-    console.log(`[MealPlan] ${mainMeals.length} main meals @ ${adjustedMainCal} cal, ${snacks.length} snacks @ ${snackCalories} cal`);
-    
-    // Food database with per100g values
-    const foodDB = {
-      proteins: [
-        { food: 'חזה עוף צלוי', per100g: { calories: 165, protein: 31, fat: 3.6 } },
-        { food: 'סלמון אפוי', per100g: { calories: 208, protein: 20, fat: 13 } },
-        { food: 'סטייק בקר', per100g: { calories: 250, protein: 26, fat: 15 } },
-        { food: 'טונה במים', per100g: { calories: 116, protein: 26, fat: 1 } },
-        { food: 'ביצים', per100g: { calories: 155, protein: 13, fat: 11 } },
-      ],
-      carbs: [
-        { food: 'אורז לבן מבושל', per100g: { calories: 130, protein: 2.7, fat: 0.3 } },
-        { food: 'פסטה מבושלת', per100g: { calories: 131, protein: 5, fat: 1.1 } },
-        { food: 'בטטה אפויה', per100g: { calories: 90, protein: 2, fat: 0.1 } },
-        { food: 'תפוחי אדמה', per100g: { calories: 77, protein: 2, fat: 0.1 } },
-        { food: 'קינואה מבושלת', per100g: { calories: 120, protein: 4.4, fat: 1.9 } },
-      ],
-      veggies: [
-        { food: 'ברוקולי מאודה', per100g: { calories: 35, protein: 2.8, fat: 0.4 } },
-        { food: 'סלט ירקות', per100g: { calories: 20, protein: 1, fat: 0.2 } },
-        { food: 'שעועית ירוקה', per100g: { calories: 31, protein: 1.8, fat: 0.1 } },
-      ],
-      snackFoods: [
-        { food: 'בננה', per100g: { calories: 89, protein: 1.1, fat: 0.3 } },
-        { food: 'תפוח', per100g: { calories: 52, protein: 0.3, fat: 0.2 } },
-        { food: 'יוגורט יווני', per100g: { calories: 97, protein: 9, fat: 5 } },
-        { food: 'שקדים', per100g: { calories: 579, protein: 21, fat: 50 } },
-        { food: 'חמאת בוטנים', per100g: { calories: 588, protein: 25, fat: 50 } },
-        { food: 'גבינת קוטג\'', per100g: { calories: 98, protein: 11, fat: 4.3 } },
-        { food: 'חטיף חלבון', per100g: { calories: 350, protein: 33, fat: 10 } },
-        { food: 'גרנולה', per100g: { calories: 450, protein: 10, fat: 18 } },
-      ],
-    };
-    
-    // Build each meal
-    for (const slot of availableSlots) {
-      const targetCal = slot.isMain ? adjustedMainCal : snackCalories;
-      
-      if (targetCal < 50) continue;
-      
-      const items = [];
-      let totalCal = 0, totalProt = 0, totalFat = 0;
-      
-      if (slot.isMain) {
-        // MAIN MEAL: Scale portions to hit target calories
-        // Typical ratio: 40% protein, 45% carbs, 15% veggies
-        const proteinCals = targetCal * 0.40;
-        const carbCals = targetCal * 0.45;
-        const veggieCals = targetCal * 0.15;
-        
-        // Pick random foods
-        const protein = foodDB.proteins[Math.floor(Math.random() * foodDB.proteins.length)];
-        const carb = foodDB.carbs[Math.floor(Math.random() * foodDB.carbs.length)];
-        const veggie = foodDB.veggies[Math.floor(Math.random() * foodDB.veggies.length)];
-        
-        // Calculate grams needed for each
-        const proteinGrams = Math.round((proteinCals / protein.per100g.calories) * 100);
-        const carbGrams = Math.round((carbCals / carb.per100g.calories) * 100);
-        const veggieGrams = Math.round((veggieCals / veggie.per100g.calories) * 100);
-        
-        // Add protein
-        const pCal = Math.round((protein.per100g.calories * proteinGrams) / 100);
-        const pProt = Math.round((protein.per100g.protein * proteinGrams) / 100);
-        const pFat = Math.round((protein.per100g.fat * proteinGrams) / 100);
-        items.push({ food: protein.food, amount: `${proteinGrams}g`, calories: pCal, protein: pProt, fat: pFat });
-        totalCal += pCal; totalProt += pProt; totalFat += pFat;
-        
-        // Add carbs
-        const cCal = Math.round((carb.per100g.calories * carbGrams) / 100);
-        const cProt = Math.round((carb.per100g.protein * carbGrams) / 100);
-        const cFat = Math.round((carb.per100g.fat * carbGrams) / 100);
-        items.push({ food: carb.food, amount: `${carbGrams}g`, calories: cCal, protein: cProt, fat: cFat });
-        totalCal += cCal; totalProt += cProt; totalFat += cFat;
-        
-        // Add veggies
-        const vCal = Math.round((veggie.per100g.calories * veggieGrams) / 100);
-        const vProt = Math.round((veggie.per100g.protein * veggieGrams) / 100);
-        const vFat = Math.round((veggie.per100g.fat * veggieGrams) / 100);
-        items.push({ food: veggie.food, amount: `${veggieGrams}g`, calories: vCal, protein: vProt, fat: vFat });
-        totalCal += vCal; totalProt += vProt; totalFat += vFat;
-        
-      } else {
-        // SNACK: Build to hit target calories
-        let remainingCal = targetCal;
-        const usedFoods = new Set();
-        
-        // Add 2-3 snack items
-        while (remainingCal > 50 && items.length < 3) {
-          const availableFoods = foodDB.snackFoods.filter(f => !usedFoods.has(f.food));
-          if (availableFoods.length === 0) break;
-          
-          const snack = availableFoods[Math.floor(Math.random() * availableFoods.length)];
-          usedFoods.add(snack.food);
-          
-          // Calculate grams to use portion of remaining calories
-          const calToUse = items.length === 0 ? remainingCal * 0.6 : remainingCal;
-          const grams = Math.round((calToUse / snack.per100g.calories) * 100);
-          const adjustedGrams = Math.min(grams, 150); // Cap at 150g per item
-          
-          const sCal = Math.round((snack.per100g.calories * adjustedGrams) / 100);
-          const sProt = Math.round((snack.per100g.protein * adjustedGrams) / 100);
-          const sFat = Math.round((snack.per100g.fat * adjustedGrams) / 100);
-          
-          items.push({ food: snack.food, amount: `${adjustedGrams}g`, calories: sCal, protein: sProt, fat: sFat });
-          totalCal += sCal; totalProt += sProt; totalFat += sFat;
-          remainingCal -= sCal;
-        }
-      }
-      
-      const mealName = slot.isMain 
-        ? (slot.type === 'dinner' ? 'ארוחת ערב' : slot.type === 'lunch' ? 'ארוחת צהריים' : 'ארוחת בוקר')
-        : 'נשנוש';
-      
-      meals.push({
-        time: `${slot.hour}:00`,
-        type: slot.type,
-        name: mealName,
-        items: items,
-        totalCalories: totalCal,
-        totalProtein: totalProt,
-        totalFat: totalFat,
-      });
-      
-      console.log(`[MealPlan] Added ${mealName} @ ${slot.hour}:00 with ${totalCal} cal`);
-    }
-    
-    const grandTotal = meals.reduce((sum, m) => sum + m.totalCalories, 0);
-    console.log(`[MealPlan] Total plan: ${grandTotal} cal (target: ${totalCalories})`);
-    
-    return { meals };
-  };
-  
-  // Generate daily meal plan
   const handleGenerateDailyPlan = async () => {
     setIsGeneratingPlan(true);
     setIsTyping(true);
-    
+
     try {
-      // Calculate remaining
-      const remaining = {
-        calories: Math.max(0, targets.calories - (dailyStats?.calories || 0)),
-        protein: Math.max(0, targets.protein - (dailyStats?.protein || 0)),
-        fat: Math.max(0, targets.fat - (dailyStats?.fat || 0)),
-      };
-      
       const currentHour = new Date().getHours();
-      const goal = profile?.goal || 'maintain';
-      const userName = profile?.name || '';
-      
-      // Try AI-powered meal plan first, fallback to local builder
-      let mealPlan;
-      try {
-        mealPlan = await generateAIMealPlan(remaining, goal, currentHour, userName);
-      } catch (e) {
-        console.log('AI meal plan failed, using fallback');
-        mealPlan = buildMealPlanFallback(remaining, goal, currentHour);
-      }
-      
+      const plan = await buildMealPlan({
+        profile,
+        dailyStats,
+        targets,
+        currentHour,
+      });
+
       setIsTyping(false);
-      
-      if (mealPlan && mealPlan.meals && mealPlan.meals.length > 0) {
-        setDailyMealPlan(mealPlan);
-        
-        // Add intro message
-        const introText = goal === 'bulk' 
-          ? `💪 ${userName}, הנה התפריט שלך להיום! נשארו ${remaining.calories} קלוריות - בוא נדחוף!`
-          : goal === 'cut'
-          ? `🎯 ${userName}, הנה התפריט המותאם שלך! נשארו ${remaining.calories} קלוריות - נשמור על איזון.`
-          : `📋 ${userName}, הנה התפריט שלך להיום!`;
-        
+
+      if (plan && plan.meals && plan.meals.length > 0) {
+        setDailyMealPlan(plan);
+        const introText = buildPlanIntro({ plan, profile });
         const uniqueId = `plan_${Date.now()}`;
-        addMessage({ 
-          text: introText, 
-          isBot: true, 
-          id: uniqueId, 
-          type: 'meal_plan', 
-          data: mealPlan 
+        mealPlanMsgIdRef.current = uniqueId;
+        addMessage({
+          text: introText,
+          isBot: true,
+          id: uniqueId,
+          type: 'meal_plan',
+          data: plan,
         });
       } else {
-        await addBotMessage('😅 לא נשארו הרבה קלוריות להיום. אולי כוס מים?');
+        const fallbackText = plan?.capMessage
+          || '😅 לא נשארו הרבה קלוריות להיום. אולי כוס מים?';
+        await addBotMessage(fallbackText);
       }
-      
     } catch (error) {
       console.error('Error generating meal plan:', error);
       setIsTyping(false);
@@ -1041,176 +936,52 @@ export default function Home() {
       setIsGeneratingPlan(false);
     }
   };
-  
-  // Handle request to change a meal in the plan - returns detailed alternatives
-  const handleRequestMealChange = async (meal, mealIndex) => {
-    const goal = profile?.goal || 'maintain';
-    const targetCal = meal.totalCalories || meal.calories || 400;
-    
-    // Detailed alternatives with items breakdown
-    const alternativesDB = {
-      cut: {
-        main: [
-          {
-            name: 'סלט עם חזה עוף',
-            items: [
-              { food: 'חזה עוף צלוי', amount: '150g', calories: 248, protein: 47, fat: 5 },
-              { food: 'סלט ירקות', amount: '200g', calories: 40, protein: 2, fat: 0 },
-              { food: 'שמן זית', amount: '1 כף', calories: 120, protein: 0, fat: 14 },
-            ],
-            totalCalories: 408, totalProtein: 49, totalFat: 19,
-          },
-          {
-            name: 'טונה עם קינואה',
-            items: [
-              { food: 'טונה במים', amount: '140g', calories: 140, protein: 32, fat: 1 },
-              { food: 'קינואה מבושלת', amount: '150g', calories: 180, protein: 6, fat: 3 },
-              { food: 'ירקות טריים', amount: '100g', calories: 25, protein: 1, fat: 0 },
-            ],
-            totalCalories: 345, totalProtein: 39, totalFat: 4,
-          },
-          {
-            name: 'חביתת ירקות',
-            items: [
-              { food: 'ביצים', amount: '3 יחידות', calories: 234, protein: 18, fat: 15 },
-              { food: 'ירקות מוקפצים', amount: '150g', calories: 45, protein: 2, fat: 1 },
-              { food: 'לחם מלא', amount: '1 פרוסה', calories: 81, protein: 4, fat: 1 },
-            ],
-            totalCalories: 360, totalProtein: 24, totalFat: 17,
-          },
-        ],
-        snack: [
-          {
-            name: 'יוגורט עם פירות',
-            items: [
-              { food: 'יוגורט יווני 0%', amount: '170g', calories: 100, protein: 17, fat: 1 },
-              { food: 'פירות יער', amount: '100g', calories: 57, protein: 1, fat: 0 },
-            ],
-            totalCalories: 157, totalProtein: 18, totalFat: 1,
-          },
-          {
-            name: 'ירקות עם חומוס',
-            items: [
-              { food: 'גזר', amount: '100g', calories: 41, protein: 1, fat: 0 },
-              { food: 'מלפפון', amount: '100g', calories: 16, protein: 1, fat: 0 },
-              { food: 'חומוס', amount: '50g', calories: 83, protein: 4, fat: 5 },
-            ],
-            totalCalories: 140, totalProtein: 6, totalFat: 5,
-          },
-        ],
-      },
-      bulk: {
-        main: [
-          {
-            name: 'פסטה עם בשר',
-            items: [
-              { food: 'פסטה מבושלת', amount: '250g', calories: 328, protein: 13, fat: 3 },
-              { food: 'בשר טחון 15%', amount: '200g', calories: 430, protein: 42, fat: 28 },
-              { food: 'רוטב עגבניות', amount: '100g', calories: 50, protein: 2, fat: 1 },
-            ],
-            totalCalories: 808, totalProtein: 57, totalFat: 32,
-          },
-          {
-            name: 'אורז עם עוף ואבוקדו',
-            items: [
-              { food: 'אורז לבן', amount: '250g', calories: 325, protein: 7, fat: 1 },
-              { food: 'חזה עוף', amount: '200g', calories: 330, protein: 62, fat: 7 },
-              { food: 'אבוקדו', amount: '100g', calories: 160, protein: 2, fat: 15 },
-            ],
-            totalCalories: 815, totalProtein: 71, totalFat: 23,
-          },
-          {
-            name: 'סטייק עם בטטה',
-            items: [
-              { food: 'סטייק אנטריקוט', amount: '250g', calories: 550, protein: 55, fat: 36 },
-              { food: 'בטטה אפויה', amount: '200g', calories: 180, protein: 4, fat: 0 },
-              { food: 'ברוקולי', amount: '100g', calories: 35, protein: 3, fat: 0 },
-            ],
-            totalCalories: 765, totalProtein: 62, totalFat: 36,
-          },
-        ],
-        snack: [
-          {
-            name: 'שייק חלבון דחוס',
-            items: [
-              { food: 'חלב מלא', amount: '300ml', calories: 183, protein: 10, fat: 10 },
-              { food: 'בננה', amount: '1 גדולה', calories: 121, protein: 1, fat: 0 },
-              { food: 'חמאת בוטנים', amount: '2 כפות', calories: 188, protein: 8, fat: 16 },
-              { food: 'אבקת חלבון', amount: '1 סקופ', calories: 120, protein: 24, fat: 2 },
-            ],
-            totalCalories: 612, totalProtein: 43, totalFat: 28,
-          },
-          {
-            name: 'טוסט עם אבוקדו וביצים',
-            items: [
-              { food: 'לחם מלא', amount: '2 פרוסות', calories: 162, protein: 8, fat: 2 },
-              { food: 'אבוקדו', amount: '100g', calories: 160, protein: 2, fat: 15 },
-              { food: 'ביצים', amount: '2 יחידות', calories: 156, protein: 12, fat: 10 },
-            ],
-            totalCalories: 478, totalProtein: 22, totalFat: 27,
-          },
-        ],
-      },
-      maintain: {
-        main: [
-          {
-            name: 'עוף עם אורז וירקות',
-            items: [
-              { food: 'חזה עוף', amount: '150g', calories: 248, protein: 47, fat: 5 },
-              { food: 'אורז', amount: '150g', calories: 195, protein: 4, fat: 0 },
-              { food: 'ירקות מאודים', amount: '150g', calories: 50, protein: 3, fat: 0 },
-            ],
-            totalCalories: 493, totalProtein: 54, totalFat: 5,
-          },
-          {
-            name: 'שקשוקה',
-            items: [
-              { food: 'ביצים', amount: '3 יחידות', calories: 234, protein: 18, fat: 15 },
-              { food: 'רוטב עגבניות', amount: '200g', calories: 80, protein: 3, fat: 2 },
-              { food: 'לחם', amount: '2 פרוסות', calories: 162, protein: 6, fat: 2 },
-            ],
-            totalCalories: 476, totalProtein: 27, totalFat: 19,
-          },
-        ],
-        snack: [
-          {
-            name: 'יוגורט עם גרנולה',
-            items: [
-              { food: 'יוגורט', amount: '150g', calories: 89, protein: 15, fat: 1 },
-              { food: 'גרנולה', amount: '40g', calories: 180, protein: 4, fat: 7 },
-              { food: 'דבש', amount: '1 כף', calories: 64, protein: 0, fat: 0 },
-            ],
-            totalCalories: 333, totalProtein: 19, totalFat: 8,
-          },
-        ],
-      },
-    };
-    
-    const templates = alternativesDB[goal] || alternativesDB.maintain;
-    const isSnack = meal.type?.includes('snack');
-    const options = isSnack ? templates.snack : templates.main;
-    
-    return options || templates.main;
+
+  // Returns calorie-matched alternatives for the swap (↔) button.
+  const handleRequestMealChange = async (meal /* , mealIndex */) => {
+    return swapMeal({
+      meal,
+      allMeals: dailyMealPlan?.meals || [],
+      targets,
+      dailyStats,
+      profile,
+    });
   };
-  
-  // Handle selecting an alternative meal
+
+  // Apply the user's chosen alternative; re-scale it down if placing it
+  // back into the plan would push projected daily total above the
+  // overshoot ceiling.
   const handleSelectAlternative = (alternative, mealIndex) => {
     if (!dailyMealPlan || !dailyMealPlan.meals) return;
-    
+
+    const otherMeals = dailyMealPlan.meals.filter((_, i) => i !== mealIndex);
+    const safeAlt = enforceOvershootGuard({
+      alternative,
+      otherMeals,
+      targets,
+      dailyStats,
+    });
+
     const updatedMeals = [...dailyMealPlan.meals];
     const originalMeal = updatedMeals[mealIndex];
-    
     updatedMeals[mealIndex] = {
       ...originalMeal,
-      name: alternative.name,
-      items: alternative.items,
-      totalCalories: alternative.totalCalories,
-      totalProtein: alternative.totalProtein,
-      totalFat: alternative.totalFat,
+      name: safeAlt.name,
+      items: safeAlt.items,
+      totalCalories: safeAlt.totalCalories,
+      totalProtein: safeAlt.totalProtein,
+      totalFat: safeAlt.totalFat,
     };
-    
-    const updatedPlan = { ...dailyMealPlan, meals: updatedMeals };
-    setDailyMealPlan(updatedPlan);
+
+    const newPlan = { ...dailyMealPlan, meals: updatedMeals };
+    setDailyMealPlan(newPlan);
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.type === 'meal_plan' && m.id === mealPlanMsgIdRef.current
+          ? { ...m, data: newPlan }
+          : m,
+      ),
+    );
   };
 
   const addBotMessage = async (text, type = 'text', data = null) => {
@@ -1329,25 +1100,38 @@ export default function Home() {
     }, 600);
   };
 
-  const updateBalanceWithoutGoalCheck = async (calories, protein, fat, waterGlasses = null) => {
-    console.log('[Home] updateBalanceWithoutGoalCheck:', { calories, protein, fat, waterGlasses });
+  const updateBalanceWithoutGoalCheck = async (
+    calories,
+    protein,
+    fat,
+    waterGlasses = null,
+    carbDelta = 0
+  ) => {
+    devLog('[Home] updateBalanceWithoutGoalCheck:', { calories, protein, fat, waterGlasses, carbDelta });
     // Round values to avoid floating point precision issues
     const newStats = {
       calories: Math.round((dailyStats?.calories || 0) + calories),
       protein: Math.round(((dailyStats?.protein || 0) + protein) * 10) / 10,
       fat: Math.round(((dailyStats?.fat || 0) + fat) * 10) / 10,
+      carbs: Math.round(((dailyStats?.carbs || 0) + (carbDelta || 0)) * 10) / 10,
       water_glasses: waterGlasses !== null ? waterGlasses : (dailyStats?.water_glasses || 0),
     };
 
-    console.log('[Home] New stats to save:', newStats);
+    devLog('[Home] New stats to save:', newStats);
     // setDailyStats now automatically syncs to Supabase via AppContext
     await setDailyStats(newStats);
 
     return newStats;
   };
 
-  const updateBalance = async (calories, protein, fat, waterGlasses = null) => {
-    const newStats = await updateBalanceWithoutGoalCheck(calories, protein, fat, waterGlasses);
+  const updateBalance = async (calories, protein, fat, waterGlasses = null, carbDelta = 0) => {
+    const newStats = await updateBalanceWithoutGoalCheck(
+      calories,
+      protein,
+      fat,
+      waterGlasses,
+      carbDelta
+    );
     checkGoalReached(newStats);
     return newStats;
   };
@@ -1355,15 +1139,34 @@ export default function Home() {
   // Ref to prevent double processing
   const isProcessingRef = useRef(false);
 
+  const handleStopChatGeneration = () => {
+    chatGenAbortRef.current?.abort();
+  };
+
   // ============================================================
   // NEW SMART CHATBOT - Context-Aware Message Handler
   // ============================================================
   const handleSendMessage = async () => {
     if (!inputText.trim()) return;
 
+    if (!user?.id) {
+      await addBotMessage('התחבר/י כדי לשלוח הודעות לבוט.');
+      return;
+    }
+
+    // Hard blocks: quota exhausted or cooling down after errors.
+    if (rateLimited) {
+      devLog('⚠️ Send blocked: daily rate limit reached');
+      return;
+    }
+    if (cooldownUntilMs > Date.now()) {
+      devLog('⚠️ Send blocked: cooldown active');
+      return;
+    }
+
     // Prevent double processing
     if (isProcessingRef.current) {
-      console.log('⚠️ Already processing, skipping...');
+      devLog('⚠️ Already processing, skipping...');
       return;
     }
     isProcessingRef.current = true;
@@ -1381,13 +1184,16 @@ export default function Home() {
     }
 
     setIsTyping(true);
+    const ac = new AbortController();
+    chatGenAbortRef.current = ac;
+    setChatGenAbortable(true);
 
     try {
       // Build context for smart chatbot
       const context = {
-        conversationHistory: messages.slice(-10).map(m => ({ 
-          isBot: m.isBot, 
-          text: m.text || '' 
+        conversationHistory: messages.slice(-10).map(m => ({
+          isBot: m.isBot,
+          text: m.text || ''
         })),
         pendingAction: pendingFoods.length > 0 ? {
           type: 'waiting_quantity',
@@ -1397,31 +1203,82 @@ export default function Home() {
         targets: targets || {},
         userName: profile?.first_name || '',
         goal: profile?.goal || 'maintain', // User goal: cut, maintain, bulk, lean_bulk
+        signal: ac.signal,
       };
 
       // Call smart chatbot
       const result = await processUserMessage(userText, context);
       setIsTyping(false);
 
-      console.log('🤖 Smart Bot Result:', result.intent, result.action?.type);
+      devLog('🤖 Smart Bot Result:', result.intent, result.action?.type);
 
-      // Handle the response based on intent and action
-      await handleSmartBotAction(result);
+      // Success: reset the error streak and bump the local usage counter so
+      // the "X left today" banner updates without an extra DB round-trip.
+      setConsecutiveErrors(0);
+      setDailyUsage((prev) => {
+        if (prev) return { ...prev, used: (prev.used || 0) + 1 };
+        return { used: 1, limit: DAILY_LIMIT };
+      });
+
+      await handleSmartBotAction(result, userText);
 
     } catch (error) {
-      console.error('Smart chatbot error:', error);
       setIsTyping(false);
-      await addBotMessage('אופס, משהו השתבש 😅 נסה שוב?');
+
+      if (error?.code === 'USER_CANCEL') {
+        return;
+      }
+
+      // Daily quota exhausted -> lock the input and show the server's message.
+      if (error instanceof RateLimitError || error?.name === 'RateLimitError') {
+        console.warn('🚫 Rate limited:', error.message);
+        setRateLimited(true);
+        setCooldownUntilMs(Date.now() + COOLDOWN_MS_RATE_LIMITED);
+        setDailyUsage({
+          used: error.used ?? dailyUsage?.used ?? 0,
+          limit: error.limit ?? dailyUsage?.limit ?? DAILY_LIMIT,
+        });
+        await addBotMessage(
+          error.message || `הגעת למכסה היומית של ההודעות (${error.limit ?? DAILY_LIMIT}). נסה שוב מחר 🌙`
+        );
+        return;
+      }
+
+      // Generic failure -> short cooldown, escalate to circuit breaker on repeats.
+      console.error('Smart chatbot error:', error);
+      const newErrorCount = consecutiveErrors + 1;
+      setConsecutiveErrors(newErrorCount);
+      const cooldown = newErrorCount >= ERROR_THRESHOLD_CIRCUIT
+        ? COOLDOWN_MS_CIRCUIT
+        : COOLDOWN_MS_AFTER_ERROR;
+      setCooldownUntilMs(Date.now() + cooldown);
+      const cooldownSec = Math.round(cooldown / 1000);
+      await addBotMessage(
+        newErrorCount >= ERROR_THRESHOLD_CIRCUIT
+          ? `נתקלתי בכמה תקלות ברצף. ממתין ${cooldownSec} שניות לפני שננסה שוב 🛠️`
+          : `אופס, משהו השתבש 😅 ננסה שוב בעוד ${cooldownSec} שניות.`
+      );
+    } finally {
+      // Single source of truth: the processing lock is released here
+      // regardless of which code path finished. handleSmartBotAction's
+      // own reset is kept as a no-op for safety.
       isProcessingRef.current = false;
+      chatGenAbortRef.current = null;
+      setChatGenAbortable(false);
     }
   };
 
   // Handle actions from smart chatbot
-  const handleSmartBotAction = async (result) => {
+  const handleSmartBotAction = async (result, lastUserText = '') => {
     const { intent, response, action } = result;
 
-    // Always show the bot's response first
-    if (response) {
+    const quantityCueInMessage =
+      typeof lastUserText === 'string' && userMessageImpliesFoodQuantity(lastUserText);
+
+    const skipResponseBubble =
+      action?.type === 'ask_quantity' && !quantityCueInMessage;
+
+    if (response && !skipResponseBubble) {
       await addBotMessage(response);
     }
 
@@ -1432,7 +1289,10 @@ export default function Home() {
           // Process foods with nutritional data
           if (action.data?.foods?.length > 0) {
             setTimeout(async () => {
-              await processReadyFood(action.data.foods);
+              await processReadyFood(action.data.foods, {
+                meal_group_id: action.data.meal_group_id,
+                source_message_text: action.data.source_message_text,
+              });
             }, 500);
           }
           break;
@@ -1454,9 +1314,44 @@ export default function Home() {
           break;
 
         case 'ask_quantity':
-          // Set pending foods and wait for quantity
+          if (quantityCueInMessage) {
+            devLog('[Home] Skipping portion card: user message includes quantity cues');
+            if (response && String(response).trim()) {
+              await addBotMessage(response);
+            } else {
+              await addBotMessage(
+                'לא הצלחתי לסיים את הרישום מההודעה. נסה לשלוח שוב.'
+              );
+            }
+            break;
+          }
           if (action.data?.foods?.length > 0) {
-            setPendingFoods(action.data.foods);
+            try {
+              const hinted = await prefillAskQuantityHints(action.data.foods);
+              const withGuesses = attachPortionGuesses(hinted);
+              setPendingFoods(withGuesses);
+              const intro = buildPortionConfirmIntro(withGuesses);
+              const uniqueId = `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+              addMessage({
+                text: intro,
+                isBot: true,
+                id: uniqueId,
+                type: 'portion_confirm',
+                data: { items: withGuesses },
+              });
+            } catch (e) {
+              console.warn('[Home] prefillAskQuantityHints:', e);
+              const fallback = attachPortionGuesses(action.data.foods);
+              setPendingFoods(fallback);
+              const intro = buildPortionConfirmIntro(fallback);
+              addMessage({
+                text: intro,
+                isBot: true,
+                id: `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+                type: 'portion_confirm',
+                data: { items: fallback },
+              });
+            }
           }
           break;
 
@@ -1499,20 +1394,23 @@ export default function Home() {
 
       case INTENTS.CONFIRM:
         // If we have pending foods, process them
-        console.log('[Home] CONFIRM intent, pendingFoods:', pendingFoods.length);
+        devLog('[Home] CONFIRM intent, pendingFoods:', pendingFoods.length);
         if (pendingFoods.length > 0) {
           const currentPendingFoods = [...pendingFoods];
           setPendingFoods([]);
           
           // Check if foods have direct calories or need calculation from per_100g
-          console.log('[Home] Processing foods for confirmation:', currentPendingFoods);
+          devLog('[Home] Processing foods for confirmation:', currentPendingFoods);
           const processedFoods = currentPendingFoods.map(food => {
             if (food.calories !== undefined) {
               // Already has calculated calories (from 3D or other source)
               return food;
             } else if (food.calories_per_100g !== undefined) {
               // Need to calculate from per_100g values (from image recognition)
-              const grams = food.estimated_portion_grams || 100;
+              const grams =
+                food.estimated_portion_grams ??
+                defaultTotalGramsForFood(food) ??
+                100;
               const multiplier = grams / 100;
               return {
                 name: food.name,
@@ -1520,6 +1418,7 @@ export default function Home() {
                 calories: Math.round(food.calories_per_100g * multiplier),
                 protein: Math.round((food.protein_per_100g || 0) * multiplier * 10) / 10,
                 fat: Math.round((food.fat_per_100g || 0) * multiplier * 10) / 10,
+                carbs: Math.round((food.carbs_per_100g || 0) * multiplier * 10) / 10,
               };
             }
             return food;
@@ -1549,6 +1448,7 @@ export default function Home() {
                 calories: Math.round((food.calories_per_100g || 100) * multiplier),
                 protein: Math.round((food.protein_per_100g || 5) * multiplier * 10) / 10,
                 fat: Math.round((food.fat_per_100g || 3) * multiplier * 10) / 10,
+                carbs: Math.round((food.carbs_per_100g || 15) * multiplier * 10) / 10,
               });
             }
 
@@ -1561,8 +1461,6 @@ export default function Home() {
         // General chat - just show the response (already done above)
         break;
     }
-
-    isProcessingRef.current = false;
   };
 
   const saveRecipe = async () => {
@@ -1588,7 +1486,7 @@ export default function Home() {
       }
       await addBotMessage('המתכון נשמר. תמצא אותו בתפריט.');
     } catch (error) {
-      console.log('Error saving recipe:', error);
+      devLog('Error saving recipe:', error);
     }
     setPendingRecipe(null);
   };
@@ -1598,22 +1496,22 @@ export default function Home() {
   };
 
   const pickImage = async (source) => {
-    console.log('📷 pickImage called with source:', source);
-    console.log('📷 ImagePicker object:', ImagePicker ? 'exists' : 'null');
-    console.log('📷 launchCameraAsync:', typeof ImagePicker?.launchCameraAsync);
-    console.log('📷 launchImageLibraryAsync:', typeof ImagePicker?.launchImageLibraryAsync);
+    devLog('📷 pickImage called with source:', source);
+    devLog('📷 ImagePicker object:', ImagePicker ? 'exists' : 'null');
+    devLog('📷 launchCameraAsync:', typeof ImagePicker?.launchCameraAsync);
+    devLog('📷 launchImageLibraryAsync:', typeof ImagePicker?.launchImageLibraryAsync);
 
     try {
       let result;
       if (source === 'camera') {
-        console.log('📷 Requesting camera permissions...');
+        devLog('📷 Requesting camera permissions...');
         const permResult = await ImagePicker.requestCameraPermissionsAsync();
-        console.log('📷 Camera permission result:', JSON.stringify(permResult));
+        devLog('📷 Camera permission result:', JSON.stringify(permResult));
         if (permResult.status !== 'granted') {
           Alert.alert('שגיאה', 'נדרשת הרשאה למצלמה. אנא אשר בהגדרות המכשיר.');
           return;
         }
-        console.log('📷 Launching camera NOW...');
+        devLog('📷 Launching camera NOW...');
         result = await ImagePicker.launchCameraAsync({
           allowsEditing: true,
           aspect: [4, 3],
@@ -1621,16 +1519,16 @@ export default function Home() {
           base64: true,
           mediaTypes: ImagePicker.MediaTypeOptions.Images,
         });
-        console.log('📷 Camera result received:', JSON.stringify(result));
+        devLog('📷 Camera result received:', JSON.stringify(result));
       } else {
-        console.log('🖼️ Requesting gallery permissions...');
+        devLog('🖼️ Requesting gallery permissions...');
         const permResult = await ImagePicker.requestMediaLibraryPermissionsAsync();
-        console.log('🖼️ Gallery permission result:', JSON.stringify(permResult));
+        devLog('🖼️ Gallery permission result:', JSON.stringify(permResult));
         if (permResult.status !== 'granted') {
           Alert.alert('שגיאה', 'נדרשת הרשאה לגלריה. אנא אשר בהגדרות המכשיר.');
           return;
         }
-        console.log('🖼️ Launching gallery NOW...');
+        devLog('🖼️ Launching gallery NOW...');
         result = await ImagePicker.launchImageLibraryAsync({
           allowsEditing: true,
           aspect: [4, 3],
@@ -1638,35 +1536,36 @@ export default function Home() {
           base64: true,
           mediaTypes: ImagePicker.MediaTypeOptions.Images,
         });
-        console.log('🖼️ Gallery result received:', JSON.stringify(result));
+        devLog('🖼️ Gallery result received:', JSON.stringify(result));
       }
 
-      console.log('📷 Checking result...');
+      devLog('📷 Checking result...');
       if (result && !result.canceled && result.assets && result.assets[0]) {
-        console.log('✅ Got image, uploading...');
+        devLog('✅ Got image, uploading...');
         await handleImageUpload(result.assets[0]);
       } else {
-        console.log('⚠️ No image selected or canceled');
+        devLog('⚠️ No image selected or canceled');
       }
     } catch (error) {
-      console.log('❌ pickImage Error:', error);
-      console.log('❌ Error message:', error?.message);
-      console.log('❌ Error stack:', error?.stack);
+      devLog('❌ pickImage Error:', error);
+      devLog('❌ Error message:', error?.message);
+      devLog('❌ Error stack:', error?.stack);
       Alert.alert('שגיאה', `אירעה שגיאה: ${error?.message || 'לא ידוע'}`);
     }
   };
 
   const showImagePicker = useCallback(() => {
-    console.log('📸 showImagePicker called');
+    if (!SHOW_CHAT_CAMERA_CAPTURE_IN_UI) return;
+    devLog('📸 showImagePicker called');
     setShowImageModal(true);
   }, []);
 
   const handleImageChoice = useCallback((type) => {
-    console.log('🎯 handleImageChoice called with:', type);
+    devLog('🎯 handleImageChoice called with:', type);
     setShowImageModal(false);
     // Wait for modal to fully close before opening picker
     setTimeout(() => {
-      console.log('⏰ Timeout fired, calling pickImage...');
+      devLog('⏰ Timeout fired, calling pickImage...');
       pickImage(type);
     }, 600);
   }, []);
@@ -1691,7 +1590,7 @@ export default function Home() {
 
   const handleImageUpload = async (asset) => {
     // 1. Show Typing Indicator (Thinking...)
-    console.log('🔄 handleImageUpload: Setting isTyping to true');
+    devLog('🔄 handleImageUpload: Setting isTyping to true');
     setIsTyping(true);
     setFoodData(null);
 
@@ -1752,7 +1651,7 @@ export default function Home() {
 
     } catch (error) {
       setIsTyping(false);
-      console.log('Analysis Error:', error);
+      devLog('Analysis Error:', error);
       await addBotMessage('הייתה בעיה בניתוח התמונה. נסה שוב.');
     } finally {
       setIsAnalyzing(false);
@@ -1760,7 +1659,7 @@ export default function Home() {
   };
 
   const handleConfirmFood = async (food) => {
-    console.log('[Home] handleConfirmFood called with:', food);
+    devLog('[Home] handleConfirmFood called with:', food);
     setShowFoodModal(false);
 
     // Bot confirmation message
@@ -1768,7 +1667,13 @@ export default function Home() {
 
     // Update balance (stay collapsed - mini rings animate)
     setTimeout(async () => {
-      const newStats = await updateBalanceWithoutGoalCheck(food.calories, food.protein, food.fat);
+      const newStats = await updateBalanceWithoutGoalCheck(
+        food.calories,
+        food.protein,
+        food.fat,
+        null,
+        food.carbs || 0
+      );
       
       // Save meal to database (skip stats update - already done above)
       await addMeal({
@@ -1776,7 +1681,12 @@ export default function Home() {
         calories: food.calories || 0,
         protein: food.protein || 0,
         fat: food.fat || 0,
+        carbs: food.carbs || 0,
+        source: 'photo',
       }, true);
+
+      // Reset the inactivity nudge timer.
+      updateLastFoodLog();
 
       // Wait then check goals
       setTimeout(() => {
@@ -1903,12 +1813,62 @@ export default function Home() {
           )}
           {/* Show meal plan card */}
           <DailyMealPlanCard
-            data={msg.data}
+            data={
+              dailyMealPlan && msg.id === mealPlanMsgIdRef.current
+                ? dailyMealPlan
+                : msg.data
+            }
             onRequestMealChange={handleRequestMealChange}
             onSelectAlternative={handleSelectAlternative}
             isLoading={isGeneratingPlan}
           />
         </View>
+      );
+    }
+
+    if (msg.type === 'portion_confirm' && msg.data?.items?.length) {
+      return (
+        <View key={msg.id || `msg_${index}`} style={{ gap: 8 }}>
+          {msg.text ? <ChatMessage message={msg.text} isBot /> : null}
+          <PortionConfirmCard
+            items={msg.data.items}
+            locked={!!appliedPortionIds[msg.id]}
+            onApplied={async (foods) => {
+              setAppliedPortionIds((prev) => ({ ...prev, [msg.id]: true }));
+              setPendingFoods([]);
+              await processReadyFood(foods);
+            }}
+          />
+        </View>
+      );
+    }
+
+    if (msg.type === 'brachot_advice' && msg.text) {
+      const nav = BRACHOT_AFTER_NAV[msg.data?.afterBlessing];
+      const db = typeof msg.data?.before === 'string' ? msg.data.before.trim() : '';
+      const da = typeof msg.data?.after === 'string' ? msg.data.after.trim() : '';
+      const dn = typeof msg.data?.note === 'string' ? msg.data.note.trim() : '';
+      const hasLayout = Boolean(db || da || dn);
+      return (
+        <ChatMessage
+          key={msg.id || `msg_${index}`}
+          message={hasLayout ? '' : msg.text}
+          brachotLayout={
+            hasLayout
+              ? { before: db, after: da, note: dn }
+              : null
+          }
+          isBot={true}
+          actionButton={
+            nav
+              ? {
+                  label: nav.label,
+                  onPress: () =>
+                    navigation.navigate('BirkatHamazon', { initialPrayer: nav.prayer }),
+                }
+              : undefined
+          }
+        />
       );
     }
     
@@ -1977,12 +1937,22 @@ export default function Home() {
               }}
               activeOpacity={0.7}
             >
-              <View style={styles.menuLine} />
-              <View style={styles.menuLine} />
-              <View style={styles.menuLine} />
+              <GrayIconChip>
+                <View style={styles.menuLine} />
+                <View style={styles.menuLine} />
+                <View style={styles.menuLine} />
+              </GrayIconChip>
             </TouchableOpacity>
           </View>
         </View>
+
+        {showQuotaWarningBanner && (
+          <View style={styles.quotaWarningBanner} accessibilityRole="text">
+            <Text style={styles.quotaWarningText}>
+              נותרו {quotaRemaining} הודעות AI להיום (מתוך {quotaLimit})
+            </Text>
+          </View>
+        )}
 
         {/* Main Content Area - Chat with floating Balance Header */}
         <View style={styles.mainContent}>
@@ -2045,18 +2015,40 @@ export default function Home() {
           </View>
         )}
 
-        {/* Input Area - הסתר כשהמצלמה פתוחה */}
-        {!show3DModal && (
-          <InputBar
-            inputText={inputText}
-            onChangeText={setInputText}
-            onSend={handleSendMessage}
-            onCameraPress={showImagePicker}
-            onWater={addWater}
-            onFocus={collapseHeader}
-            onDailyPlanPress={handleGenerateDailyPlan}
-            on3DPress={() => setShow3DModal(true)}
-          />
+        {/* Input Area + AI disclaimer under it (white strip at bottom) */}
+        {!show3DModal && !showBrachotAskModal && (
+          <>
+            <InputBar
+              inputText={inputText}
+              onChangeText={setInputText}
+              onSend={handleSendMessage}
+              onCameraPress={
+                SHOW_CHAT_CAMERA_CAPTURE_IN_UI ? showImagePicker : undefined
+              }
+              onWater={addWater}
+              onFocus={collapseHeader}
+              onDailyPlanPress={handleGenerateDailyPlan}
+              onBrachotPress={handleOpenBrachot}
+              on3DPress={() => setShow3DModal(true)}
+              disabled={inputBarDisabled}
+              disabledReason={inputBarDisabled ? inputBarReason : ''}
+              isBusy={!inputBarDisabled && isTyping}
+              canStop={chatGenAbortable}
+              onStop={handleStopChatGeneration}
+            />
+            <View style={styles.aiBottomDisclaimer} accessibilityRole="text">
+              <Text style={styles.aiBottomDisclaimerText}>
+                תשובות וניתוחי בינה מלאכותית עלולים לטעות; אין להחליף ייעוץ מקצועי.{' '}
+                <Text
+                  style={styles.aiBottomDisclaimerLink}
+                  onPress={() => navigation.navigate('Sources')}
+                  accessibilityRole="link"
+                >
+                  אודות ומקורות
+                </Text>
+              </Text>
+            </View>
+          </>
         )}
 
         {/* Side Menu */}
@@ -2083,6 +2075,13 @@ export default function Home() {
           onComplete={handle3DComplete}
         />
 
+        <BrachotAskModal
+          visible={showBrachotAskModal}
+          onClose={() => setShowBrachotAskModal(false)}
+          onOpenFullTexts={handleOpenBirkatFromBrachotModal}
+          onSubmit={handleBrachotSubmit}
+        />
+
         {/* Image Picker - Bubble Card */}
         {showImageModal && (
           <View style={[styles.bubbleOverlay, { paddingBottom: keyboardHeight > 0 ? keyboardHeight - 10 : (Platform.OS === 'ios' ? 90 : 70) }]}>
@@ -2100,16 +2099,18 @@ export default function Home() {
               ]}
             >
               <View style={styles.bubbleOptions}>
-                <TouchableOpacity
-                  style={styles.bubbleButton}
-                  onPress={() => handleImageChoice('camera')}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.bubbleIconContainer}>
-                    <Ionicons name="camera" size={26} color="#007AFF" />
-                  </View>
-                  <Text style={styles.bubbleButtonText}>צלם</Text>
-                </TouchableOpacity>
+                {SHOW_CHAT_CAMERA_CAPTURE_IN_UI ? (
+                  <TouchableOpacity
+                    style={styles.bubbleButton}
+                    onPress={() => handleImageChoice('camera')}
+                    activeOpacity={0.7}
+                  >
+                    <View style={styles.bubbleIconContainer}>
+                      <Ionicons name="camera" size={26} color="#007AFF" />
+                    </View>
+                    <Text style={styles.bubbleButtonText}>צלם</Text>
+                  </TouchableOpacity>
+                ) : null}
 
                 <TouchableOpacity
                   style={styles.bubbleButton}
@@ -2182,6 +2183,44 @@ const styles = StyleSheet.create({
   keyboardView: {
     flex: 1,
     backgroundColor: 'transparent',
+  },
+  quotaWarningBanner: {
+    marginHorizontal: 12,
+    marginTop: 4,
+    marginBottom: 0,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    backgroundColor: '#FEF9C3',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#FDE047',
+  },
+  quotaWarningText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#854D0E',
+    textAlign: 'center',
+  },
+  aiBottomDisclaimer: {
+    paddingHorizontal: 10,
+    // אנכי אסימטרי: מעט מרווח מתחת לקלט, מעט יותר לתחתית המסך (בטוח + קריאות)
+    paddingTop: 2,
+    paddingBottom: 5,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#F3F4F6',
+    backgroundColor: '#FFFFFF',
+  },
+  aiBottomDisclaimerText: {
+    fontSize: 8.5,
+    lineHeight: 12,
+    color: '#9CA3AF',
+    textAlign: 'right',
+  },
+  aiBottomDisclaimerLink: {
+    fontSize: 8.5,
+    color: '#6B7280',
+    textDecorationLine: 'underline',
+    fontWeight: '600',
   },
   loadingContainer: {
     flex: 1,
@@ -2274,6 +2313,7 @@ const styles = StyleSheet.create({
     color: '#374151',
     letterSpacing: 0.5,
   },
+  /** Same hit area as InputBar `iconBtn` (32px chip inside 38). */
   menuBtn: {
     width: 38,
     height: 38,
@@ -2281,11 +2321,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   menuLine: {
-    width: 20,
-    height: 2.5,
-    backgroundColor: '#6B7280',
+    width: 16,
+    height: 2,
+    backgroundColor: '#4B5563',
     borderRadius: 1,
-    marginVertical: 2.5,
+    marginVertical: 2,
   },
 
   // Chat

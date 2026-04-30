@@ -16,7 +16,9 @@ import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { AppProvider } from './src/context/AppContext';
 import { StatusBar } from 'expo-status-bar';
-import { View, StyleSheet, Image, Text } from 'react-native';
+import { View, StyleSheet, Image, Text, AppState } from 'react-native';
+import useNotifications from './src/hooks/useNotifications';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { supabase } from './src/api/supabaseClient';
 import Animated, {
   useSharedValue,
@@ -25,7 +27,18 @@ import Animated, {
   withRepeat,
   withSequence,
   withDelay,
+  configureReanimatedLogger,
+  ReanimatedLogLevel,
 } from 'react-native-reanimated';
+
+// Silence the noisy "Reading from `value` during component render" warning.
+// It fires from `useAnimatedStyle`'s initial JS-thread pass on every render,
+// which is expected behavior - not something we can (or should) refactor per
+// call site. We still surface real errors.
+configureReanimatedLogger({
+  level: ReanimatedLogLevel.warn,
+  strict: false,
+});
 
 const LOGO_IMAGE = require('./assets/logo.png');
 
@@ -42,6 +55,9 @@ import AIInsights from './src/screens/AIInsights';
 import Profile from './src/screens/Profile';
 import Account from './src/screens/Account';
 import RecentMeals from './src/screens/RecentMeals';
+import Sources from './src/screens/Sources';
+import Subscription from './src/screens/Subscription';
+import BirkatHamazon from './src/screens/BirkatHamazon';
 
 const Stack = createNativeStackNavigator();
 
@@ -115,6 +131,9 @@ const MainStack = ({ hasCompletedOnboarding }) => {
       <Stack.Screen name="Profile" component={Profile} />
       <Stack.Screen name="Account" component={Account} />
       <Stack.Screen name="RecentMeals" component={RecentMeals} />
+      <Stack.Screen name="Sources" component={Sources} />
+      <Stack.Screen name="Subscription" component={Subscription} />
+      <Stack.Screen name="BirkatHamazon" component={BirkatHamazon} />
     </Stack.Navigator>
   );
 };
@@ -134,13 +153,17 @@ export default function App() {
     if (initRef.current) return;
     initRef.current = true;
 
-    console.log('[App] Initializing...');
+    if (__DEV__) {
+      console.log('[App] Initializing...');
+    }
 
     // ================================================
     // SINGLE SOURCE OF TRUTH: Supabase auth listener
     // ================================================
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
-      console.log('[App] Auth event:', event, newSession?.user?.email || 'no user');
+      if (__DEV__ && event !== 'TOKEN_REFRESHED') {
+        console.log('[App] Auth event:', event, newSession?.user?.email || 'no user');
+      }
 
       // Mark auth as resolved on ANY event
       authResolvedRef.current = true;
@@ -149,24 +172,31 @@ export default function App() {
         case 'INITIAL_SESSION':
           // First check on app load
           if (newSession) {
-            console.log('[App] Initial session found');
+            if (__DEV__) console.log('[App] Initial session found');
             setSession(newSession);
             setAuthState('authenticated');
           } else {
-            console.log('[App] No initial session');
+            if (__DEV__) console.log('[App] No initial session');
             setAuthState('unauthenticated');
           }
           break;
 
         case 'SIGNED_IN':
-        case 'TOKEN_REFRESHED':
-          console.log('[App] User signed in');
+          if (__DEV__) console.log('[App] User signed in');
           setSession(newSession);
           setAuthState('authenticated');
           break;
 
+        case 'TOKEN_REFRESHED':
+          // Silent session rotation — avoid log spam
+          if (newSession) {
+            setSession(newSession);
+            setAuthState('authenticated');
+          }
+          break;
+
         case 'SIGNED_OUT':
-          console.log('[App] User signed out');
+          if (__DEV__) console.log('[App] User signed out');
           setSession(null);
           setAuthState('unauthenticated');
           break;
@@ -183,7 +213,9 @@ export default function App() {
     // Timeout fallback - ONLY if no auth event has fired yet
     const timeout = setTimeout(() => {
       if (!authResolvedRef.current) {
-        console.log('[App] Timeout - no auth event received, forcing unauthenticated');
+        if (__DEV__) {
+          console.log('[App] Timeout - no auth event received, forcing unauthenticated');
+        }
         setAuthState('unauthenticated');
       }
     }, 5000);
@@ -200,27 +232,35 @@ export default function App() {
   
   // Still initializing
   if (authState === 'initializing') {
-    return <LoadingScreen />;
+    return (
+      <SafeAreaProvider>
+        <LoadingScreen />
+      </SafeAreaProvider>
+    );
   }
 
   // Not logged in
   if (authState === 'unauthenticated' || !session) {
     return (
-      <NavigationContainer>
-        <StatusBar style="dark" />
-        <AuthStack />
-      </NavigationContainer>
+      <SafeAreaProvider>
+        <NavigationContainer>
+          <StatusBar style="dark" />
+          <AuthStack />
+        </NavigationContainer>
+      </SafeAreaProvider>
     );
   }
 
   // Logged in - wrap with AppProvider
   return (
-    <AppProvider session={session}>
-      <NavigationContainer>
-        <StatusBar style="dark" />
-        <AppNavigator />
-      </NavigationContainer>
-    </AppProvider>
+    <SafeAreaProvider>
+      <AppProvider session={session}>
+        <NavigationContainer>
+          <StatusBar style="dark" />
+          <AppNavigator />
+        </NavigationContainer>
+      </AppProvider>
+    </SafeAreaProvider>
   );
 }
 
@@ -229,10 +269,48 @@ export default function App() {
 // ============================================================
 const AppNavigator = () => {
   const { isLoading, hasCompletedOnboarding } = require('./src/context/AppContext').useApp();
-  
-  console.log('[AppNavigator] isLoading:', isLoading, 'hasCompletedOnboarding:', hasCompletedOnboarding);
+  const { checkAndSendSmartNotification, scheduleInactivityCheck } = useNotifications();
+  const navLogRef = useRef(null);
 
-  // Show loading while AppContext loads data
+  useEffect(() => {
+    const prev = navLogRef.current;
+    if (
+      __DEV__ &&
+      (!prev ||
+        prev.isLoading !== isLoading ||
+        prev.hasCompletedOnboarding !== hasCompletedOnboarding)
+    ) {
+      console.log(
+        '[AppNavigator] isLoading:',
+        isLoading,
+        'hasCompletedOnboarding:',
+        hasCompletedOnboarding,
+      );
+    }
+    navLogRef.current = { isLoading, hasCompletedOnboarding };
+  }, [isLoading, hasCompletedOnboarding]);
+
+  // Re-arm the 3.5h inactivity nudge whenever the app comes to the
+  // foreground, and run a "should we ping the user now?" check. This
+  // catches users who reopened the app late and shouldn't get an
+  // immediate push.
+  useEffect(() => {
+    // Run once on mount.
+    scheduleInactivityCheck();
+    checkAndSendSmartNotification();
+
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') {
+        checkAndSendSmartNotification();
+        scheduleInactivityCheck();
+      }
+    });
+    return () => {
+      sub.remove();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   if (isLoading) {
     return <LoadingScreen />;
   }

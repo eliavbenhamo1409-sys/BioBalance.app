@@ -1,16 +1,14 @@
 // Base44 Client for React Native
-// Now using OpenAI for AI features and AsyncStorage for local data
+// LLM features use Gemini (Supabase gemini-proxy); local data in AsyncStorage.
 
 import { mockEntities } from './mockDatabase';
-import { chatWithBot, analyzeFoodFromImage, calculateNutritionTargets, getNutritionAdvice } from './openaiClient';
+import { chatWithBot, analyzeFoodFromImage, calculateNutritionTargets, getNutritionAdvice } from './aiClient';
 
-// Export base44 with OpenAI integrations
 export const base44 = {
   entities: mockEntities,
   
   integrations: {
     Core: {
-      // Chat with AI bot using OpenAI
       InvokeLLM: async ({ prompt, context = {} }) => {
         try {
           const response = await chatWithBot(prompt, context);
@@ -21,7 +19,6 @@ export const base44 = {
         }
       },
       
-      // Analyze food from image using OpenAI Vision
       AnalyzeFood: async (imageBase64) => {
         try {
           return await analyzeFoodFromImage(imageBase64);

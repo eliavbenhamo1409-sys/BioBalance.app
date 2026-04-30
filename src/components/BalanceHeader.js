@@ -22,6 +22,7 @@ import Svg, { Circle, Defs, LinearGradient as SvgGradient, Stop } from 'react-na
 const AnimatedCircle = Animated.createAnimatedComponent(Circle);
 import { Ionicons } from '@expo/vector-icons';
 import { LinearGradient } from 'expo-linear-gradient';
+import SourceCitation from './SourceCitation';
 
 // ============================================
 // PREMIUM COLOR SYSTEM - Clean & Professional
@@ -263,7 +264,6 @@ function BalanceHeader({
   animationKey = 0, // Changes after celebrations to force re-animate
   onRecentMealsPress, // Navigate to recent meals screen
 }) {
-  console.log('[BalanceHeader] Render with dailyStats:', dailyStats?.calories);
   const stats = useMemo(() => {
     const calories = Math.round(dailyStats?.calories || 0);
     const protein = Math.round((dailyStats?.protein || 0) * 10) / 10;
@@ -414,6 +414,9 @@ function BalanceHeader({
             />
           </View>
           
+          {/* Sources citation (Apple 1.4.1) */}
+          <SourceCitation variant="compact" />
+
           {/* Pull Handle */}
           <View style={styles.handle}>
             <View style={styles.handleBar} />

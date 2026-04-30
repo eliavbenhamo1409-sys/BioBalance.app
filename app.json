@@ -4,7 +4,6 @@
     "slug": "nature-bot",
     "scheme": "biobalance",
     "version": "1.0.0",
-    "sdkVersion": "54.0.0",
     "orientation": "portrait",
     "icon": "./assets/logo.png",
     "userInterfaceStyle": "light",
@@ -70,12 +69,6 @@
       ],
       "expo-web-browser"
     ],
-    "notification": {
-      "icon": "./assets/logo.png",
-      "color": "#4CAF50",
-      "androidMode": "default",
-      "androidCollapsedTitle": "BioBalance"
-    },
     "extra": {
       "eas": {
         "projectId": "b157cbea-c910-42b8-9a61-2176df385f8f"

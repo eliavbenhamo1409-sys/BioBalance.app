@@ -47,19 +47,47 @@ const DEFAULT_REMINDERS = [
 
 const STORAGE_KEY = '@biobalance_reminders';
 const LAST_ACTIVITY_KEY = '@biobalance_last_activity';
-const LAST_FOOD_LOG_KEY = '@biobalance_last_food_log';
+export const LAST_FOOD_LOG_KEY = '@biobalance_last_food_log';
 
-// Smart notification messages
+// ------------------------------------------------------------
+// INACTIVITY NUDGE TUNING
+// ------------------------------------------------------------
+// Threshold for "you haven't logged in a while" reminder. Lowered from
+// 5h to 3.5h so users feel a friendly hand on the shoulder before they
+// drift away — not a guilt-trip the next morning.
+const INACTIVITY_HOURS = 3.5;
+const INACTIVITY_SECONDS = Math.round(INACTIVITY_HOURS * 60 * 60);
+// Quiet window. Outside of QUIET_START..QUIET_END we never push a smart
+// nudge, so the app doesn't wake users at 02:00.
+const QUIET_START_HOUR = 9;   // inclusive
+const QUIET_END_HOUR   = 22;  // exclusive
+const INACTIVITY_ID = 'inactivity_3h5';
+
+/** Expo SDK 55+: use string literal; SchedulableTriggerInputTypes may be undefined at runtime. */
+const triggerAfterSeconds = (seconds) => ({
+  type: 'timeInterval',
+  seconds,
+});
+
+// ------------------------------------------------------------
+// SMART MESSAGE POOL
+// ------------------------------------------------------------
+// Supportive tone: we're a teammate, not a nag. The randomness keeps
+// the copy from feeling robotic.
 const SMART_MESSAGES = {
   noActivity: [
-    { title: '👋 היי, איפה נעלמת?', body: 'לא ראיתי אותך הרבה זמן! בוא נעדכן את המאזן' },
-    { title: '🤔 מה נשמע?', body: 'עבר זמן מאז שדיברנו. מה אכלת היום?' },
-    { title: '💪 חוזרים למסלול?', body: 'היי! מחכה לך כאן. בוא נמשיך לעקוב יחד' },
+    { title: '👋 היי, איפה נעלמת?',     body: 'לא ראיתי אותך הרבה זמן — בוא נעדכן יחד את המאזן' },
+    { title: '🤔 מה נשמע?',              body: 'עבר זמן מאז שדיברנו. מה אכלת היום?' },
+    { title: '💪 חוזרים למסלול?',         body: 'אני פה, ברגע שאתה רוצה — נמשיך לעקוב יחד' },
   ],
   noFoodLog: [
-    { title: '🍽️ מה אכלת היום?', body: 'שמתי לב שלא עדכנת. תעדכן אותי!' },
-    { title: '📝 שכחת לעדכן?', body: 'עוד לא נרשמה ארוחה היום. ספר לי מה אכלת!' },
-    { title: '🥗 עדכון קצר?', body: 'רק רוצה לוודא שאתה זוכר לעדכן. מה היה בתפריט?' },
+    { title: '💚 אני כאן בשבילך',         body: 'אני כאן כדי לעזור לך להקפיד על הארוחות. תזין לי מה אכלת ונמשיך' },
+    { title: '✨ נשלים יחד',              body: 'לא ראיתי הזנה מזה זמן — בוא נשלים יחד, אפילו ארוחה קטנה עוזרת' },
+    { title: '🍽️ זה הזמן לאכול',          body: 'אפילו נשנוש קטן מקדם אותך ליעד. מה תרצה לאכול עכשיו?' },
+    { title: '🌱 תזכורת חברית',          body: 'הגוף עובד טוב כשמזינים אותו. עדכן אותי מה היה בתפריט?' },
+    { title: '🤝 שקט בצ׳אט',             body: 'אני איתך — עדכן אותי מה אכלת ונחזור למסלול' },
+    { title: '💬 רק רגע אחד',             body: 'תהיה כן עם עצמך — מה אכלת ב-3 השעות האחרונות?' },
+    { title: '🎯 ביחד לוקחים את זה',      body: 'הצעדים הקטנים הם שמנצחים. תזין ארוחה קטנה ונמשיך מכאן' },
   ],
 };
 
@@ -172,7 +200,7 @@ export const useNotifications = () => {
           body: 'מעולה! התזכורות שלך מוכנות לעבודה. נתראה בארוחות! 😊',
           sound: true,
         },
-        trigger: null, // null = send immediately
+        trigger: triggerAfterSeconds(1),
       });
       console.log('Test notification sent');
     } catch (error) {
@@ -316,6 +344,12 @@ export const useNotifications = () => {
     if (granted) {
       await saveReminders(DEFAULT_REMINDERS);
       await scheduleAllReminders();
+      // Seed last-food-log so the 3.5h timer doesn't fire immediately
+      // after onboarding when the user hasn't had a chance to log yet.
+      const ts = Date.now().toString();
+      await AsyncStorage.setItem(LAST_FOOD_LOG_KEY, ts).catch(() => {});
+      await AsyncStorage.setItem(LAST_ACTIVITY_KEY, ts).catch(() => {});
+      await scheduleInactivityCheck();
       return true;
     }
     return false;
@@ -363,11 +397,14 @@ export const useNotifications = () => {
     }
   };
 
-  // Update last food log timestamp
+  // Update last-food-log timestamp AND re-arm the 3.5h inactivity
+  // nudge so a fresh log effectively resets the timer.
   const updateLastFoodLog = async () => {
     try {
-      await AsyncStorage.setItem(LAST_FOOD_LOG_KEY, Date.now().toString());
-      await AsyncStorage.setItem(LAST_ACTIVITY_KEY, Date.now().toString());
+      const ts = Date.now().toString();
+      await AsyncStorage.setItem(LAST_FOOD_LOG_KEY, ts);
+      await AsyncStorage.setItem(LAST_ACTIVITY_KEY, ts);
+      await scheduleInactivityCheck();
     } catch (e) {
       console.log('Error saving last food log:', e);
     }
@@ -379,36 +416,35 @@ export const useNotifications = () => {
     return messages[Math.floor(Math.random() * messages.length)];
   };
 
-  // Check if should send smart notification
+  // Check if should send smart notification.
+  // Quiet hours: skip outside 09:00..22:00 (inclusive..exclusive).
+  // Threshold: INACTIVITY_HOURS since last food log.
   const checkAndSendSmartNotification = async () => {
     try {
       const now = Date.now();
       const currentHour = new Date().getHours();
-      
-      // Only send between 9:00 and 21:00
-      if (currentHour < 9 || currentHour > 21) {
+
+      if (currentHour < QUIET_START_HOUR || currentHour >= QUIET_END_HOUR) {
         return null;
       }
 
-      // Check last food log (more important)
+      // Primary signal: when did the user last log food?
       const lastFoodLog = await AsyncStorage.getItem(LAST_FOOD_LOG_KEY);
       if (lastFoodLog) {
-        const hoursSinceFood = (now - parseInt(lastFoodLog)) / (1000 * 60 * 60);
-        
-        // If more than 5 hours since last food log (and it's daytime)
-        if (hoursSinceFood > 5) {
+        const hoursSinceFood = (now - parseInt(lastFoodLog, 10)) / (1000 * 60 * 60);
+
+        if (hoursSinceFood >= INACTIVITY_HOURS) {
           const message = getRandomMessage('noFoodLog');
           await sendSmartNotification(message.title, message.body, 'noFoodLog');
           return 'noFoodLog';
         }
       }
 
-      // Check last activity
+      // Secondary signal: longer-term ghosting (no app interaction at all).
       const lastActivity = await AsyncStorage.getItem(LAST_ACTIVITY_KEY);
       if (lastActivity) {
-        const hoursSinceActivity = (now - parseInt(lastActivity)) / (1000 * 60 * 60);
-        
-        // If more than 24 hours since last activity
+        const hoursSinceActivity = (now - parseInt(lastActivity, 10)) / (1000 * 60 * 60);
+
         if (hoursSinceActivity > 24) {
           const message = getRandomMessage('noActivity');
           await sendSmartNotification(message.title, message.body, 'noActivity');
@@ -431,7 +467,7 @@ export const useNotifications = () => {
       if (lastSmartNotif) {
         const hoursSinceLast = (Date.now() - parseInt(lastSmartNotif)) / (1000 * 60 * 60);
         if (hoursSinceLast < 3) {
-          console.log('Smart notification skipped - sent recently');
+          if (__DEV__) console.log('Smart notification skipped - sent recently');
           return;
         }
       }
@@ -443,9 +479,7 @@ export const useNotifications = () => {
           data: { type: 'smart', category: type },
           sound: true,
         },
-        trigger: {
-          seconds: 5, // Send in 5 seconds
-        },
+        trigger: triggerAfterSeconds(5),
       });
 
       // Record that we sent this notification
@@ -456,23 +490,52 @@ export const useNotifications = () => {
     }
   };
 
-  // Schedule periodic check for inactivity (call this on app start)
+  // Re-arm the 3.5h inactivity nudge.
+  //
+  // We schedule a one-shot notification with a freshly-picked random
+  // message. The caller is expected to call this:
+  //   - on app start
+  //   - on every food log (so logging resets the timer)
+  //   - on AppState 'active' (so reopening the app resets the timer)
+  //
+  // We refuse to schedule a notification that would land outside the
+  // quiet window (i.e. if firing it would happen between 22:00 and
+  // 09:00). In that case we delay the firing time until the next 09:00.
   const scheduleInactivityCheck = async () => {
     try {
-      // Cancel existing inactivity check
+      // Drop any prior pending one-shot.
+      await Notifications.cancelScheduledNotificationAsync(INACTIVITY_ID).catch(() => {});
+      // Also clear the legacy id if it ever lingers from older builds.
       await Notifications.cancelScheduledNotificationAsync('inactivity_check').catch(() => {});
 
-      // Schedule check in 6 hours
+      const now = new Date();
+      const fireDate = new Date(now.getTime() + INACTIVITY_SECONDS * 1000);
+
+      // Push fire time forward into the active window if it lands at night.
+      const fireHour = fireDate.getHours();
+      if (fireHour < QUIET_START_HOUR) {
+        fireDate.setHours(QUIET_START_HOUR, 0, 0, 0);
+      } else if (fireHour >= QUIET_END_HOUR) {
+        fireDate.setDate(fireDate.getDate() + 1);
+        fireDate.setHours(QUIET_START_HOUR, 0, 0, 0);
+      }
+
+      const secondsUntilFire = Math.max(60, Math.round((fireDate.getTime() - now.getTime()) / 1000));
+
+      // Pick the supportive copy at scheduling time so the notification
+      // payload itself carries a randomized message — Expo doesn't let
+      // us pick at delivery time on iOS.
+      const message = getRandomMessage('noFoodLog');
+
       await Notifications.scheduleNotificationAsync({
         content: {
-          title: '🔔 תזכורת',
-          body: 'זמן לבדוק את המאזן היומי!',
-          data: { type: 'inactivity_check' },
+          title: message.title,
+          body: message.body,
+          data: { type: 'inactivity_3h5' },
+          sound: true,
         },
-        trigger: {
-          seconds: 6 * 60 * 60, // 6 hours
-        },
-        identifier: 'inactivity_check',
+        trigger: triggerAfterSeconds(secondsUntilFire),
+        identifier: INACTIVITY_ID,
       });
     } catch (e) {
       console.log('Error scheduling inactivity check:', e);

@@ -36,11 +36,13 @@ const SPRING_CONFIG = {
 
 const menuItems = [
   { id: 'home', label: 'דף בית', icon: '🏠', screen: 'Home' },
+  { id: 'birkat-hamazon', label: 'ברכת המזון', icon: '📿', screen: 'BirkatHamazon' },
   { id: 'ai-insights', label: 'AI ניתוח', icon: '🧠', screen: 'AIInsights' },
   { id: 'reminders', label: 'תזכורות ארוחות', icon: '🔔', screen: 'NotificationSettings' },
   { id: 'statistics', label: 'סטטיסטיקות', icon: '📊', screen: 'Statistics' },
   { id: 'recipes', label: 'מתכונים', icon: '📖', screen: 'Recipes' },
   { id: 'settings', label: 'הגדרות', icon: '⚙️', screen: 'Profile' },
+  { id: 'sources', label: 'אודות ומקורות', icon: '📚', screen: 'Sources' },
 ];
 
 const MenuItem = memo(({ label, icon, onPress, index, progress }) => {

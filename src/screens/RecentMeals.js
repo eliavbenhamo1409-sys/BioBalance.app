@@ -5,13 +5,13 @@ import {
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  SafeAreaView,
   Dimensions,
   Platform,
   Modal,
   TextInput,
   KeyboardAvoidingView,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 import { Ionicons } from '@expo/vector-icons';
 import Animated, {
@@ -24,6 +24,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useApp } from '../context/AppContext';
 import { useNavigation } from '@react-navigation/native';
+import SourceCitation from '../components/SourceCitation';
 import moment from 'moment';
 import 'moment/locale/he';
 
@@ -374,6 +375,7 @@ export default function RecentMeals() {
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
+        <SourceCitation variant="compact" />
         {todayMeals.length > 0 ? (
           <>
             {todayMeals.map((meal) => (

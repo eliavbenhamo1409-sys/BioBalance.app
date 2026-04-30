@@ -1,21 +1,23 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   ScrollView,
-  SafeAreaView,
   TouchableOpacity,
   Alert,
   Linking,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useApp } from '../context/AppContext';
+import { deleteAccount } from '../api/supabaseClient';
 
 export default function Account() {
   const navigation = useNavigation();
   const { setProfile, setDailyStats, setMessages, logout, user, profile } = useApp();
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
 
   // Get user email from Supabase user object
   const userEmail = user?.email || 'לא מחובר';
@@ -83,7 +85,7 @@ export default function Account() {
               logout();
             } else {
               setProfile(null);
-              setDailyStats({ calories: 0, protein: 0, fat: 0, water_glasses: 0 });
+              setDailyStats({ calories: 0, protein: 0, fat: 0, carbs: 0, water_glasses: 0 });
               setMessages([]);
               navigation.reset({ index: 0, routes: [{ name: 'Onboarding' }] });
             }
@@ -105,6 +107,59 @@ export default function Account() {
           onPress: () => {
             // logout מנקה את ה-session מיידית ומעביר למסך Login
             logout();
+          },
+        },
+      ]
+    );
+  };
+
+  const performDeleteAccount = async () => {
+    if (isDeletingAccount) return;
+    setIsDeletingAccount(true);
+    try {
+      const result = await deleteAccount();
+      if (result?.error) {
+        setIsDeletingAccount(false);
+        Alert.alert(
+          'שגיאה במחיקה',
+          'לא הצלחנו למחוק את החשבון. נסה שוב מאוחר יותר או פנה לתמיכה ב-support@biobalance.app.'
+        );
+        return;
+      }
+      try {
+        await AsyncStorage.clear();
+      } catch {}
+      await logout();
+      Alert.alert('החשבון נמחק', 'כל הנתונים שלך הוסרו מהשרת.');
+    } catch {
+      setIsDeletingAccount(false);
+      Alert.alert('שגיאה במחיקה', 'אירעה תקלה. נסה שוב.');
+    }
+  };
+
+  const handleDeleteAccount = () => {
+    if (isDeletingAccount) return;
+    Alert.alert(
+      'מחיקת חשבון',
+      'פעולה זו תמחק לצמיתות את החשבון, הפרופיל, היסטוריית הארוחות, התמונות וכל הנתונים שלך. לא ניתן לשחזר זאת.',
+      [
+        { text: 'ביטול', style: 'cancel' },
+        {
+          text: 'המשך',
+          style: 'destructive',
+          onPress: () => {
+            Alert.alert(
+              'אישור אחרון',
+              'האם אתה בטוח לחלוטין? המחיקה היא בלתי הפיכה.',
+              [
+                { text: 'בטל', style: 'cancel' },
+                {
+                  text: 'מחק את החשבון',
+                  style: 'destructive',
+                  onPress: performDeleteAccount,
+                },
+              ]
+            );
           },
         },
       ]
@@ -178,6 +233,20 @@ export default function Account() {
             <Text style={styles.dangerIcon}>🚪</Text>
             <Text style={styles.dangerText}>התנתקות</Text>
           </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.dangerBtn, styles.deleteAccountBtn, isDeletingAccount && { opacity: 0.6 }]}
+            onPress={handleDeleteAccount}
+            disabled={isDeletingAccount}
+          >
+            <Text style={styles.dangerIcon}>⚠️</Text>
+            <Text style={[styles.dangerText, styles.deleteAccountTextStrong]}>
+              {isDeletingAccount ? 'מוחק…' : 'מחיקת חשבון לצמיתות'}
+            </Text>
+          </TouchableOpacity>
+          <Text style={styles.deleteAccountHelp}>
+            מחיקה תסיר את החשבון, הפרופיל, התמונות וכל הנתונים מהשרת. אין שחזור.
+          </Text>
         </View>
 
         {/* App Info */}
@@ -393,6 +462,22 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: '#DC2626',
+  },
+  deleteAccountBtn: {
+    backgroundColor: '#FFFFFF',
+    borderColor: '#DC2626',
+    borderWidth: 1.5,
+  },
+  deleteAccountTextStrong: {
+    fontWeight: '700',
+  },
+  deleteAccountHelp: {
+    fontSize: 11,
+    color: '#94A3B8',
+    textAlign: 'right',
+    marginTop: 2,
+    marginBottom: 4,
+    lineHeight: 16,
   },
 
   // App Info

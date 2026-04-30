@@ -4,14 +4,15 @@ import {
   Text,
   StyleSheet,
   ScrollView,
-  SafeAreaView,
   TouchableOpacity,
   Dimensions,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import Svg, { Path, Line, Circle, Text as SvgText, G } from 'react-native-svg';
 import { useApp } from '../context/AppContext';
 import { getDailyStatsHistory } from '../api/supabaseClient';
+import SourceCitation from '../components/SourceCitation';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
@@ -273,6 +274,8 @@ export default function Statistics() {
             <StatItem label="מים" value={dailyStats?.water_glasses || 0} target={profile?.water_target || 8} emoji="💧" />
           </View>
         </View>
+
+        <SourceCitation variant="full" />
 
         <View style={{ height: 40 }} />
       </ScrollView>

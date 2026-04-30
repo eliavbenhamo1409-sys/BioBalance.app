@@ -15,7 +15,10 @@
     },
     "production": {
       "autoIncrement": true,
-      "channel": "production"
+      "channel": "production",
+      "env": {
+        "EXPO_NO_CAPABILITY_SYNC": "1"
+      }
     }
   },
   "submit": {
@@ -24,9 +27,9 @@
         "appleId": "eliav.ben.hamo@icloud.com",
         "appleTeamId": "4T29TB84F4",
         "ascAppId": "6756488694",
-        "ascApiKeyPath": "C:\\Users\\eliav\\Desktop\\AuthKey_C3482WJ78N.p8",
+        "ascApiKeyPath": "/Users/lybbnhmw/Downloads/AuthKey_6WUB5KNJF8.p8",
         "ascApiKeyIssuerId": "50f28fbf-177e-4310-8a5e-ad42cccd2071",
-        "ascApiKeyId": "C3482WJ78N"
+        "ascApiKeyId": "6WUB5KNJF8"
       }
     }
   }

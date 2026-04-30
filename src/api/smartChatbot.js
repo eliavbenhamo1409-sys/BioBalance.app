@@ -4,8 +4,35 @@
 // Built with intent classification, entity extraction, and context awareness
 // Now powered by Gemini 3 Flash + USDA FoodData Central for accurate nutrition data!
 
-import { callGemini } from './geminiClient';
-import { searchFood, getNutritionForFood, getEquivalentAlternatives } from './usdaApi';
+import { callGemini, RateLimitError } from './geminiClient';
+import { enrichAddFoodFoods, formatFoodLoggedReply } from './chatFoodResolver';
+import { searchFood } from './usdaApi';
+import { userMessageImpliesFoodQuantity } from '../utils/userMessageQuantityHints';
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    const e = new Error('Cancelled');
+    e.name = 'AbortError';
+    e.code = 'USER_CANCEL';
+    throw e;
+  }
+}
+
+const _chatLog = console.log.bind(console);
+const devLog = (...args) => {
+  if (__DEV__) _chatLog(...args);
+};
+
+function newMealGroupId() {
+  if (typeof globalThis !== 'undefined' && globalThis.crypto?.randomUUID) {
+    return globalThis.crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 
 // ============================================================
 // INTENT TYPES
@@ -34,27 +61,23 @@ export const processUserMessage = async (userMessage, context) => {
     targets = {},               // { calories: 2000, protein: 100, fat: 70, water: 8 }
     userName = '',
     timeOfDay = getTimeOfDay(),
+    signal = undefined,
   } = context;
 
-  console.log('📩 Processing message:', userMessage);
-  console.log('📊 Daily stats:', dailyStats);
-  console.log('🎯 Targets:', targets);
+  throwIfAborted(signal);
 
-  // Try to get USDA nutrition data for mentioned foods FIRST
-  let usdaData = '';
-  try {
-    usdaData = await getUSDADataForMessage(userMessage);
-    if (usdaData) {
-      console.log('✅ USDA data found:', usdaData.substring(0, 100));
-    }
-  } catch (e) {
-    console.log('⚠️ USDA lookup skipped:', e.message);
-  }
+  devLog('📩 Processing message:', userMessage);
+  devLog('📊 Daily stats:', dailyStats);
+  devLog('🎯 Targets:', targets);
+
+  // Extract-first: USDA + kcal/100g run in chatFoodResolver after Gemini names/quantities.
+  const usdaData = '';
+
+  throwIfAborted(signal);
 
   // Calculate remaining calories for context
   const caloriesLeft = (targets.calories || 2000) - (dailyStats.calories || 0);
-  
-  // Build the super-smart prompt with USDA data
+
   const systemPrompt = buildSystemPrompt({ ...context, caloriesLeft }, usdaData);
   
   // Prepare conversation for API - limit history to prevent confusion
@@ -69,41 +92,140 @@ export const processUserMessage = async (userMessage, context) => {
     const response = await callGemini(messages, {
       temperature: 0.5, // Lower temperature for more consistent responses
       maxTokens: 800,
+      signal,
     });
 
-    console.log('🤖 Raw Gemini response received');
+    devLog('🤖 Raw Gemini response received');
 
     // Parse the structured response
-    const result = parseSmartResponse(response, context);
-    
-    // ===== Water detection failsafe (from user message) =====
-    const waterGlasses = extractWaterGlasses(userMessage);
-    if (waterGlasses > 0) {
-      if (result.action?.type === 'add_food') {
-        result.action.data = result.action.data || {};
-        result.action.data.water_glasses = (result.action.data.water_glasses || 0) + waterGlasses;
-      } else if (result.action?.type === 'add_water') {
-        result.action.data = result.action.data || {};
-        result.action.data.glasses = (result.action.data.glasses || 0) + waterGlasses;
+    const resultFromModel = parseSmartResponse(response, context);
+    let result = resultFromModel;
+
+    const mergeExtractedWater = (res) => {
+      const waterGlassesEarly = extractWaterGlasses(userMessage);
+      if (waterGlassesEarly <= 0) return;
+      if (res.action?.type === 'add_food') {
+        res.action.data = res.action.data || {};
+        res.action.data.water_glasses =
+          (res.action.data.water_glasses || 0) + waterGlassesEarly;
+      } else if (res.action?.type === 'add_water') {
+        res.action.data = res.action.data || {};
+        res.action.data.glasses = (res.action.data.glasses || 0) + waterGlassesEarly;
       } else {
-        result.action = { type: 'add_water', data: { glasses: waterGlasses } };
+        res.action = { type: 'add_water', data: { glasses: waterGlassesEarly } };
+      }
+    };
+
+    mergeExtractedWater(result);
+
+    if (
+      result.action?.type === 'ask_quantity' &&
+      userMessageImpliesFoodQuantity(userMessage)
+    ) {
+      devLog('🔁 Retrying: model returned ask_quantity but message has quantity cues');
+      throwIfAborted(signal);
+      const retrySystem = buildSystemPrompt(
+        { ...context, caloriesLeft, forceNoAskQuantity: true },
+        usdaData,
+      );
+      const retryMessages = [
+        { role: 'system', content: retrySystem },
+        ...formatConversationHistory(recentHistory),
+        { role: 'user', content: userMessage },
+      ];
+      const retryResp = await callGemini(retryMessages, {
+        temperature: 0.12,
+        maxTokens: 800,
+        signal,
+      });
+      result = parseSmartResponse(retryResp, context);
+      mergeExtractedWater(result);
+    }
+
+    if (
+      result.action?.type === 'ask_quantity' &&
+      userMessageImpliesFoodQuantity(userMessage)
+    ) {
+      devLog('⚠️ ask_quantity persists after retry; stripping action');
+      result = {
+        intent: result.intent || INTENTS.GENERAL_CHAT,
+        response:
+          (result.response && String(result.response).trim()) ||
+          'לא הצלחתי לרשום מההודעה. שלח שוב או נסח מחדש.',
+        action: null,
+      };
+    }
+
+    // Deterministic USDA + validation: model extracts name + quantity + unit (or legacy grams) — no LLM kcal for add_food
+    if (result.action?.type === 'add_food' && result.action.data?.foods?.length) {
+      try {
+        const enriched = await enrichAddFoodFoods(result.action.data.foods, { signal });
+        result.action.data.foods = enriched.resolvedFoods;
+        result.action.data.needsClarification = enriched.needsClarification;
+        result.action.data.skippedOverCap = enriched.skippedOverCap;
+        const wg = Number(result.action.data.water_glasses) || 0;
+        const hasSaved =
+          enriched.hasAnythingSaved ?? enriched.resolvedFoods?.length > 0;
+        if (hasSaved) {
+          result.action.data.meal_group_id = newMealGroupId();
+          result.action.data.source_message_text =
+            String(userMessage).slice(0, 500);
+        } else {
+          delete result.action.data.meal_group_id;
+          delete result.action.data.source_message_text;
+        }
+        let replyBody = formatFoodLoggedReply(enriched.resolvedFoods, {
+          dailyStats: context.dailyStats,
+          targets: context.targets,
+          needsClarification: enriched.needsClarification,
+          skippedOverCap: enriched.skippedOverCap,
+          estimateFallbackCount: enriched.estimateFallbackCount ?? 0,
+        });
+        if (wg > 0) {
+          replyBody += `\n💧 ${wg} כוסות מים`;
+        }
+        result.response = replyBody;
+      } catch (e) {
+        if (e?.code === 'USER_CANCEL') throw e;
+        devLog('enrichAddFoodFoods:', e.message);
+        result = {
+          intent: INTENTS.GENERAL_CHAT,
+          response:
+            'לא הצלחתי לסיים את הרישום התזונתי. נסה שוב או פרט מה אכלת (שם בעברית + גרם).',
+          action: null,
+        };
       }
     }
-    
+
     // Ensure single, clean response
     if (result.response) {
       // Remove any duplicate content
       result.response = cleanDuplicateContent(result.response);
     }
     
-    console.log('✅ Final response:', result.response?.substring(0, 100));
+    devLog('✅ Final response:', result.response?.substring(0, 100));
     return result;
     
   } catch (error) {
+    // Propagate rate-limit errors so the UI can show a dedicated banner
+    // and engage its cooldown / circuit breaker. Everything else falls
+    // through to the generic "something went wrong" response.
+    if (error?.code === 'USER_CANCEL') {
+      throw error;
+    }
+    if (error instanceof RateLimitError || error?.name === 'RateLimitError') {
+      throw error;
+    }
     console.error('❌ Smart chatbot error:', error);
+    const msg = String(error?.message || '');
+    const permissionBlocked =
+      /Gemini חסום|PERMISSION_DENIED|denied access/i.test(msg) ||
+      (error?.status === 403);
     return {
       intent: INTENTS.GENERAL_CHAT,
-      response: 'סליחה, משהו השתבש. נסה שוב? 😅',
+      response: permissionBlocked
+        ? 'שירות ה-AI חסום כרגע (מפתח Gemini לא תקף או שגוגל חסמו את הפרויקט). הוסף GEMINI_API_KEY תקין ל-.env והפעל מחדש את Metro, או עדכן את סוד GEMINI_API_KEY ב-Supabase.'
+        : 'סליחה, משהו השתבש. נסה שוב? 😅',
       action: null,
     };
   }
@@ -157,145 +279,6 @@ const extractWaterGlasses = (text = '') => {
 };
 
 // ============================================================
-// GET USDA DATA FOR FOODS MENTIONED IN MESSAGE - LIVE API!
-// ============================================================
-const getUSDADataForMessage = async (message) => {
-  // Local cache for common Hebrew foods (faster response)
-  const hebrewToEnglish = {
-    'פסטה': 'pasta cooked',
-    'אורז': 'rice cooked white',
-    'לחם': 'bread white',
-    'פיתה': 'pita bread',
-    'בטטה': 'sweet potato baked',
-    'תפוח אדמה': 'potato boiled',
-    'שיבולת שועל': 'oats',
-    'עוף': 'chicken breast cooked',
-    'חזה עוף': 'chicken breast cooked',
-    'טונה': 'tuna canned',
-    'סלמון': 'salmon cooked',
-    'ביצה': 'egg whole cooked',
-    'ביצים': 'eggs whole cooked',
-    'קוטג': 'cottage cheese',
-    'יוגורט': 'yogurt greek plain',
-    'חומוס': 'hummus',
-    'אבוקדו': 'avocado raw',
-    'שקדים': 'almonds',
-    'אגוזים': 'walnuts',
-    'אגוזי מלך': 'walnuts',
-    'טחינה': 'tahini',
-    'חמאת בוטנים': 'peanut butter',
-    'בננה': 'banana raw',
-    'תפוח': 'apple raw',
-    'תפוז': 'orange raw',
-    'עגבנייה': 'tomato raw',
-    'מלפפון': 'cucumber raw',
-    'גזר': 'carrot raw',
-    'גבינה': 'cheese cheddar',
-    'גבינה צהובה': 'cheese cheddar',
-    'חלב': 'milk whole',
-    'סטייק': 'beef steak cooked',
-    'בקר': 'beef cooked',
-    'חטיף חלבון': 'protein bar',
-    'שייק חלבון': 'protein shake',
-    'קינואה': 'quinoa cooked',
-    'עדשים': 'lentils cooked',
-    'טופו': 'tofu firm',
-    'גרנולה': 'granola',
-    'חלבון': 'whey protein',
-    'ברוקולי': 'broccoli cooked',
-    'תרד': 'spinach raw',
-    'כרוב': 'cabbage raw',
-    'פלפל': 'bell pepper',
-    'חציל': 'eggplant cooked',
-    'זוקיני': 'zucchini cooked',
-    'פטריות': 'mushrooms',
-    'תמנון': 'octopus cooked',
-    'שרימפס': 'shrimp cooked',
-    'קלמרי': 'squid cooked',
-  };
-
-  const lowerMessage = message.toLowerCase();
-  const foundFoods = [];
-  const usdaResults = [];
-
-  // Find mentioned foods - prioritize longer matches first
-  const sortedKeywords = Object.keys(hebrewToEnglish).sort((a, b) => b.length - a.length);
-  
-  for (const hebrew of sortedKeywords) {
-    if (lowerMessage.includes(hebrew) && !foundFoods.some(f => f.hebrew === hebrew)) {
-      foundFoods.push({ 
-        hebrew, 
-        english: hebrewToEnglish[hebrew]
-      });
-    }
-  }
-
-  // If no Hebrew foods found, skip
-  if (foundFoods.length === 0) {
-    console.log('⚠️ No foods detected in message');
-    return '';
-  }
-
-  console.log('🔍 Searching USDA for:', foundFoods.map(f => f.english).join(', '));
-
-  // Query USDA API for each food IN PARALLEL (max 3, much faster!)
-  const foodsToSearch = foundFoods.slice(0, 3);
-  
-  const searchPromises = foodsToSearch.map(async (food) => {
-    try {
-      const results = await searchFood(food.english, 1);
-      
-      if (results && results.length > 0) {
-        const usdaFood = results[0];
-        console.log(`✅ USDA: ${food.hebrew} = ${usdaFood.calories} kcal/100g`);
-        return {
-          hebrew: food.hebrew,
-          english: usdaFood.name,
-          calories: usdaFood.calories,
-          protein: usdaFood.protein,
-          fat: usdaFood.fat,
-          carbs: usdaFood.carbs,
-          source: 'USDA FoodData Central',
-        };
-      } else {
-        console.log(`⚠️ USDA: No results for ${food.english}`);
-        return null;
-      }
-    } catch (e) {
-      console.error(`❌ USDA API error for ${food.english}:`, e.message);
-      return null;
-    }
-  });
-
-  // Wait for ALL searches to complete in parallel
-  const results = await Promise.all(searchPromises);
-  
-  // Filter out nulls (failed searches)
-  for (const result of results) {
-    if (result) {
-      usdaResults.push(result);
-    }
-  }
-
-  if (usdaResults.length === 0) {
-    return '';
-  }
-
-  // Build formatted USDA data string for the prompt
-  const formattedResults = usdaResults.map(food => 
-    `• ${food.hebrew} (${food.english}): ${food.calories} קל | ${food.protein}g חלבון | ${food.fat}g שומן | ${food.carbs}g פחמימות (ל-100 גרם)`
-  );
-
-  return `
-🔬 נתונים רשמיים מ-USDA FoodData Central:
-════════════════════════════════════════
-${formattedResults.join('\n')}
-════════════════════════════════════════
-⚠️ מקור אמין! השתמש בנתונים אלה בלבד לחישוב.
-`;
-};
-
-// ============================================================
 // FIND USDA-BASED ALTERNATIVES WITH EQUIVALENT CALORIES
 // ============================================================
 export const findUSDAAlternatives = async (originalFood, originalGrams, targetCategory = null) => {
@@ -309,16 +292,16 @@ export const findUSDAAlternatives = async (originalFood, originalGrams, targetCa
 
   try {
     // Get original food data from USDA
-    const originalResults = await searchFood(originalFood, 1);
+    const originalResults = await searchFood(originalFood);
     if (!originalResults || originalResults.length === 0) {
-      console.log('❌ Original food not found in USDA');
+      devLog('❌ Original food not found in USDA');
       return null;
     }
 
     const original = originalResults[0];
     const originalCalories = original.calories * (originalGrams / 100);
     
-    console.log(`📊 Original: ${originalFood} (${originalGrams}g) = ${Math.round(originalCalories)} kcal`);
+    devLog(`📊 Original: ${originalFood} (${originalGrams}g) = ${Math.round(originalCalories)} kcal`);
 
     // Determine which categories to search based on original food profile
     let categoriesToSearch = [];
@@ -337,7 +320,7 @@ export const findUSDAAlternatives = async (originalFood, originalGrams, targetCa
     // Search USDA for each alternative
     for (const altFood of categoriesToSearch.slice(0, 5)) {
       try {
-        const altResults = await searchFood(altFood, 1);
+        const altResults = await searchFood(altFood);
         if (altResults && altResults.length > 0) {
           const alt = altResults[0];
           
@@ -357,11 +340,11 @@ export const findUSDAAlternatives = async (originalFood, originalGrams, targetCa
               source: 'USDA',
             });
             
-            console.log(`✅ Alternative: ${alt.name} = ${equivalentGrams}g for ${Math.round(originalCalories)} kcal`);
+            devLog(`✅ Alternative: ${alt.name} = ${equivalentGrams}g for ${Math.round(originalCalories)} kcal`);
           }
         }
       } catch (e) {
-        console.log(`⚠️ Could not get alternative ${altFood}:`, e.message);
+        devLog(`⚠️ Could not get alternative ${altFood}:`, e.message);
       }
     }
 
@@ -393,6 +376,7 @@ const buildSystemPrompt = (context, usdaData = '') => {
     targets = {},
     userName = '',
     goal = 'maintain', // cut, maintain, lean_bulk, bulk
+    forceNoAskQuantity = false,
   } = context;
 
   const caloriesLeft = (targets.calories || 2000) - (dailyStats.calories || 0);
@@ -472,12 +456,22 @@ const buildSystemPrompt = (context, usdaData = '') => {
   if (pendingAction?.type === 'waiting_quantity') {
     const foodNames = pendingAction.foods.map(f => f.name).join(', ');
     pendingContext = `
-⚠️ אתה ממתין לכמות עבור: ${foodNames}
-אם המשתמש נותן מספר (גרמים) - זה בטוח התשובה!
-אם הוא אומר "כן"/"אישור" - השתמש בכמות ברירת מחדל.
-אם הוא אומר "לא"/"ביטול" - בטל הכל.
+⚠️ ממתינים לכמות עבור: ${foodNames}
+למשתמש יוצג כרטיס «הוסף / לא» עם מנות סטנדרט — אם הוא עונה במספרים בצ'אט, זו כנראה כמות בגרם.
+אם הוא כותב "כן"/"אישור" — השתמש במשקל ברירת המחדל מההקשר (יחידות או גרם שהוגדרו במערכת).
+אם "לא"/"ביטול" — בטל.
 `;
   }
+
+  const quantityGuardBlock = forceNoAskQuantity
+    ? `
+═══════════════════════════════════════
+🚨 הודעה זו: נמסרה כמות או מידה — אסור ask_quantity
+═══════════════════════════════════════
+חובה: intent report_food + action add_food בלבד.
+פרק foods עם name + quantity + unit (או grams). אין כרטיס אישור — רישום רגיל כמו תמיד.
+`
+    : '';
 
   return `אתה Bio - עוזר תזונה אישי, חכם, חברותי ותומך.
 דבר בעברית טבעית, בגובה העיניים, בלי להיות רובוטי.
@@ -495,6 +489,7 @@ Okay, the user wants... *Wait* let me think...
 
 ✅ נכון:
 {"intent": "report_food", "response": "✅ נרשם: פסטה..."}
+${quantityGuardBlock}
 
 ═══════════════════════════════════════
 📊 מצב נוכחי של המשתמש${userName ? ` (${userName})` : ''}:
@@ -693,12 +688,16 @@ ${(dailyStats.calories || 0) === 0 ? `
 📋 פירוט ה-actions:
 ═══════════════════════════════════════
 
-🍕 **add_food** - כשיש מזון עם כמות ידועה
+🍕 **add_food** — כשיש למשתמש מאכל(ים) עם כמות (מספרית) ברורה או שניתן להמיר לגרמים בקוד.
+המערכת מחשבת קלוריות בקוד אחרי חיבור ל-USDA. ב-JSON לכל פריט: **name** (עברית), **quantity** (מספר), **unit** אחד מתוך:
+\`gram\` | \`unit\` | \`slice\` | \`portion\` (אפשר גם **grams** בלבד בתאימות לאחור — אז quantity + unit מתעלמים).
+אפשר **grams** במקום quantity+unit אם כבר כתוב "150 גרם".
+אל תכתוב calories/protein/fat/carbs ב-foods.
 {
   "type": "add_food",
   "data": {
     "foods": [
-      { "name": "בננה", "grams": 120, "calories": 105, "protein": 1.3, "fat": 0.4, "carbs": 27 }
+      { "name": "בננה", "quantity": 1, "unit": "unit" }
     ]
   }
 }
@@ -707,32 +706,32 @@ ${(dailyStats.calories || 0) === 0 ? `
 🧩 פירוק הודעה מורכבת - קריטי!
 ═══════════════════════════════════════
 
-כשמשתמש שולח הודעה עם מספר מאכלים, פרק והכנס הכל!
+כשמשתמש שולח הודעה עם מספר מאכלים, פרק והכנס הכל כרשימת foods (name + quantity + unit, או grams בלבד)!
 
 **דוגמה:**
 "אכלתי לחמניה עם 2 ביצים קשות וממרח חומוס בנוסף 2 כוסות מים 8 תותים בינוניים ובננה"
 
-**פירוק:**
-1. לחמניה (1 יחידה = ~60g) → ~170 קל
-2. 2 ביצים קשות (2 × 50g = 100g) → ~155 קל
-3. ממרח חומוס (~30g) → ~50 קל
-4. 2 כוסות מים → add_water: 2
-5. 8 תותים בינוניים (~120g) → ~40 קל
-6. בננה (1 יחידה = ~120g) → ~105 קל
+**פירוק (כמות + יחידה — המרה לגרם בקוד):**
+1. לחמניה (1 יחידה) → quantity: 1, unit: "unit"
+2. 2 ביצים קשות → quantity: 2, unit: "unit" (ביצה)
+3. ממרח חומוס (~30g) → quantity: 30, unit: "gram"
+4. 2 כוסות מים → water_glasses: 2
+5. 8 תותים בינוניים → quantity: 8, unit: "unit"
+6. בננה (1 יחידה) → quantity: 1, unit: "unit"
 
-**תשובה נכונה:**
+**תשובת JSON לדוגמה (ללא מספרי קלוריות — ימולאו על ידי הקוד):**
 {
   "intent": "report_food",
-  "response": "✅ נרשם הכל!\\n────────────────────\\n🥯 לחמניה (60g) | 170 קל\\n🥚 2 ביצים קשות | 155 קל\\n🫘 חומוס (30g) | 50 קל\\n🍓 8 תותים | 40 קל\\n🍌 בננה | 105 קל\\n💧 2 כוסות מים\\n────────────────────\\nסה״כ: 520 קלוריות | 25g חלבון\\n\\n📈 מאזן יומי: 520 / ${targets.calories || 2000} קלוריות\\n💪 התחלה מצוינת!",
+  "response": "(המערכת תבנה טקסט אחרי החישוב)",
   "action": {
     "type": "add_food",
     "data": {
       "foods": [
-        { "name": "לחמניה", "grams": 60, "calories": 170, "protein": 5, "fat": 2, "carbs": 30 },
-        { "name": "2 ביצים קשות", "grams": 100, "calories": 155, "protein": 13, "fat": 11, "carbs": 1 },
-        { "name": "חומוס", "grams": 30, "calories": 50, "protein": 2.4, "fat": 3, "carbs": 4.2 },
-        { "name": "8 תותים", "grams": 120, "calories": 40, "protein": 0.8, "fat": 0.3, "carbs": 9 },
-        { "name": "בננה", "grams": 120, "calories": 105, "protein": 1.3, "fat": 0.4, "carbs": 27 }
+        { "name": "לחמניה", "quantity": 1, "unit": "unit" },
+        { "name": "2 ביצים קשות", "quantity": 2, "unit": "unit" },
+        { "name": "חומוס", "quantity": 30, "unit": "gram" },
+        { "name": "8 תותים", "quantity": 8, "unit": "unit" },
+        { "name": "בננה", "quantity": 1, "unit": "unit" }
       ],
       "water_glasses": 2
     }
@@ -741,19 +740,13 @@ ${(dailyStats.calories || 0) === 0 ? `
 
 ⚠️ כללים לפירוק:
 • "עם" / "בנוסף" / "ו-" / "גם" = מאכלים נפרדים
-• מספר + יחידה = חשב כמות (2 ביצים = 100g)
-• תותים בינוניים = ~15g ליחידה
-• בננה = ~120g ליחידה
-• לחמניה = ~60g
-• ביצה = ~50g
-
-⚠️ חשוב! כשמוסיפים מזון:
-1. פרק את כל המאכלים מההודעה
-2. בדוק בנתוני USDA שבפרומפט
-3. חשב לפי הכמות שהמשתמש אמר
-4. החזר את כל הערכים התזונתיים
-5. הראה כמה נשאר למאזן היומי
-6. אם יש מים - הוסף גם water_glasses
+• מספר + יחידה = quantity + unit (המערכת תהמיר לגרם)
+• גרם מפורש → quantity + unit "gram"
+• בננה = לרוב 1 unit; ביצה = unit לפי מספר
+• לחמניה = unit אחת
+• אם כתוב "200 גרם אורז" אפשר { "name": "אורז", "grams": 200 }
+• ב-JSON אל תחזיר calories / protein / fat / carbs — המערכת מקשרת ל-USDA ומחשבת
+• אם יש מים - הוסף water_glasses
 
 💧 **add_water** - כשמדווח על מים
 {
@@ -761,28 +754,34 @@ ${(dailyStats.calories || 0) === 0 ? `
   "data": { "glasses": 1 }
 }
 
-❓ **ask_quantity** - כשצריך לשאול כמות (חשוב מאוד!)
+❓ **ask_quantity** - **רק** כשאין שום רמז כמות בהודעה (המשך ב-UI: כרטיס **הוסף** / **לא**)
 {
   "type": "ask_quantity",
   "data": {
     "foods": [
-      { "name": "פסטה", "calories_per_100g": 131, "protein_per_100g": 5, "fat_per_100g": 1, "suggested_portion": "200 גרם" }
+      { "name": "פסטה" },
+      { "name": "בננה" }
     ]
   }
 }
 
-🚨 **מתי לשאול כמות (חובה!):**
+🚨 **מתי להחזיר ask_quantity — רק במקרה הזה:**
 ────────────────────────────────────────
-• "אכלתי פסטה" - אין כמות! → שאל כמות
-• "אכלתי תמנון" - אין כמות! → שאל כמות
-• "בננה" - אין כמות! → שאל כמות (או תניח 1 יחידה ~120g)
-• "אכלתי 200 גרם אורז" - יש כמות! → רשום ישר
+• רק שם מאכל / תיאור אכילה **בלי** מספרים, **בלי** גרם/מ״ל, **בלי** יחידות מטבח, **בלי** מילות מידה.
+• דוגמאות שכן → **ask_quantity**: "אכלתי סטייק", "בננה", "יוגורט", "אכלתי פסטה וסלט" (בלי כמה).
 
-**פורמט לשאלת כמות:**
-"📝 כמה תמנון אכלת?
-(לדוגמה: 150 גרם / חצי צלחת / מנה)"
+⛔ **לעולם לא ask_quantity** אם מופיע אחד מאלה (תמיד **add_food** + ניחוש סביר בקוד):
+────────────────────────────────────────
+• כל ספרה במסר (כולל "200 גרם", "יוגורט 3%", "2 פרוסות", "חצי צלחת").
+• גרם, מ"ל, ליטר, קילו, ק״ג, משקל.
+• חופן, כף/כפות/כפית, פרוסה/פרוסות, מנה/מנות, כוס/כוסות מזון, צלחת, קערה, גביע, קופסה.
+• "סטנדרט", "סטנדרטי/ת/יות", "בינוני/ת", "גדול/ה", "קטן/ה" כשמתארים כמות.
+• מילות מספר בעברית: שתי/שני/שלוש/… ביחיד עם המאכל.
+• "קצת", "מעט", "חצי", "רבע", "שליש" לצד מאכל.
 
-**אל תניח כמות סתם!** תמיד שאל אם לא ברור.
+במקרים האלה: **אל תשאל** ואל תשתמש ב-ask_quantity — פרק ל-add_food עם quantity+unit או grams; המערכת תאמוד לגרם ותרשום למאזן כרגיל.
+
+• שדה response ב-ask_quantity יכול להיות ריק; הממשק יציג כרטיס אישור **רק** בנתיב ask_quantity הנדיר למעלה.
 
 🔄 **show_alternatives** - כשמציג חליפות מ-USDA
 {
@@ -936,14 +935,17 @@ ${(dailyStats.calories || 0) === 0 ? `
 📈 מאזן: 1500/2000 קל
 💪 חלבון איכותי!"
 
-**אין כמות? שאל!**
-"📝 כמה תמנון אכלת? (גרם / מנה / חצי צלחת)"
+**באמת אין שום רמז כמות בהודעה?** אז בלבד אז — action ask_quantity ב-JSON (כרטיס הוסף / לא). אם יש רמז כמות — תמיד add_food.
 
 🚨 **חשוב!**
 - הודעה אחת בלבד!
 - לא להוסיף המלצות מיותרות
 - לא לשפוט על השעה
 - לא להגיד "מאוחר" או "כבדה"
+
+🥖 **ברכת המזון אחרי לחם**
+────────────────────────────────────────
+כשמדווחים לחם (או מאפה דומה) בכמות שעולה ככל הנראה על כזית, **האפליקציה מוסיפה אוטומטית** בתשובת הרישום משפט קצר על ברכת המזון (כולל הפניה למסך ״ברכת המזון״ בתפריט). **אין צורך** לשכפל את הנושא ב־response של ה־JSON — הוא יידרס בעת בניית התצוגה.
 
 📋 **פורמט לחליפות:**
 ────────────────────────────────────────
@@ -957,10 +959,9 @@ ${(dailyStats.calories || 0) === 0 ? `
 
 💡 כולם שווי ערך קלורי!"
 
-📋 **פורמט לשאלות כמות:**
+📋 **כמות חסרה — לא בצ׳אט:**
 ────────────────────────────────────────
-"📝 כמה [שם מאכל] אכלת?
-(לדוגמה: 200 גרם / צלחת / חופן)"
+השתמש ב־JSON עם type: ask_quantity בלבד; בלי טקסט ששואל "כמה גרם".
 
 📋 **כללי יציבות:**
 ────────────────────────────────────────
@@ -1017,7 +1018,7 @@ const formatConversationHistory = (history) => {
 // PARSE SMART RESPONSE
 // ============================================================
 const parseSmartResponse = (response, context) => {
-  console.log('Raw Gemini response:', response?.substring(0, 300));
+  devLog('Raw Gemini response:', response?.substring(0, 300));
   
   if (!response || typeof response !== 'string') {
     return {
@@ -1046,43 +1047,51 @@ const parseSmartResponse = (response, context) => {
       .replace(/Let me[\s\S]*?(?=\{|$)/gi, '')
       .trim();
 
-    console.log('Cleaned response:', cleanResponse?.substring(0, 200));
+    devLog('Cleaned response:', cleanResponse?.substring(0, 200));
 
-    // Method 1: Fix common JSON issues and try direct parse
+    // Method 1: Try to JSON.parse the first {...} block, escaping
+    // raw control characters inside string values as a last resort
+    // if the upstream JSON contains them (some models do).
     try {
-      // Find JSON object in response
       const jsonMatch = cleanResponse.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
-        let fixedJson = jsonMatch[0];
-        
-        // Replace actual newlines with \n inside JSON string values
-        fixedJson = fixedJson.replace(
-          /"response"\s*:\s*"([\s\S]*?)"\s*[,}]/,
-          (match, content) => {
-            const escaped = content
-              .replace(/\n/g, '\\n')
-              .replace(/\r/g, '\\r')
-              .replace(/\t/g, '\\t');
-            return `"response": "${escaped}"}`;
-          }
-        );
-        
-        const parsed = JSON.parse(fixedJson);
-        if (parsed.response) {
+        const rawJson = jsonMatch[0];
+        let parsed;
+        try {
+          parsed = JSON.parse(rawJson);
+        } catch (e1) {
+          // Fallback: escape raw newlines/tabs that appeared inside
+          // string values (the only common reason parse fails).
+          const escaped = rawJson
+            .replace(/(?<!\\)\n/g, '\\n')
+            .replace(/(?<!\\)\r/g, '\\r')
+            .replace(/(?<!\\)\t/g, '\\t');
+          parsed = JSON.parse(escaped);
+        }
+        const parsedHasPayload =
+          parsed &&
+          (Object.prototype.hasOwnProperty.call(parsed, 'response') ||
+            parsed.action ||
+            parsed.intent);
+
+        if (parsedHasPayload) {
           // Clean the response from any remaining English text
-          let finalResponse = parsed.response
-            .replace(/\\n/g, '\n')
-            .replace(/Okay[\s\S]*?quantity\.?/gi, '')
-            .replace(/\*Wait\*/gi, '')
-            .trim();
-          
+          let finalResponse =
+            typeof parsed.response === 'string'
+              ? parsed.response
+                  .replace(/\\n/g, '\n')
+                  .replace(/Okay[\s\S]*?quantity\.?/gi, '')
+                  .replace(/\*Wait\*/gi, '')
+                  .trim()
+              : '';
+
           // If no action but intent is report_food, try to build action from response
           let action = parsed.action;
           if (!action && parsed.intent === 'report_food') {
-            action = tryBuildFoodAction(fixedJson, finalResponse);
+            action = tryBuildFoodAction(rawJson, finalResponse);
           }
-          
-          console.log('✅ Parsed via fixed JSON, action:', action?.type || 'none');
+
+          devLog('✅ Parsed JSON, action:', action?.type || 'none');
           return {
             intent: parsed.intent || INTENTS.GENERAL_CHAT,
             response: finalResponse,
@@ -1091,7 +1100,7 @@ const parseSmartResponse = (response, context) => {
         }
       }
     } catch (e) {
-      console.log('Direct JSON failed:', e.message);
+      devLog('Direct JSON failed:', e.message);
     }
 
     // Method 2: Extract response between quotes manually
@@ -1133,9 +1142,9 @@ const parseSmartResponse = (response, context) => {
         if (actionMatch) {
           try {
             extractedAction = JSON.parse(actionMatch[1]);
-            console.log('✅ Extracted action:', extractedAction?.type);
+            devLog('✅ Extracted action:', extractedAction?.type);
           } catch (e) {
-            console.log('Action parse failed, trying alternative');
+            devLog('Action parse failed, trying alternative');
           }
         }
         
@@ -1146,7 +1155,7 @@ const parseSmartResponse = (response, context) => {
           extractedAction = tryBuildFoodAction(cleanResponse, extractedResponse);
         }
         
-        console.log('✅ Extracted via manual parsing:', extractedResponse.substring(0, 50));
+        devLog('✅ Extracted via manual parsing:', extractedResponse.substring(0, 50));
         return {
           intent: intent,
           response: extractedResponse,
@@ -1157,7 +1166,7 @@ const parseSmartResponse = (response, context) => {
 
     // Method 3: If response looks like plain text (no JSON), use it directly
     if (!cleanResponse.includes('"intent"') && !cleanResponse.startsWith('{')) {
-      console.log('✅ Using as plain text');
+      devLog('✅ Using as plain text');
       return {
         intent: INTENTS.GENERAL_CHAT,
         response: cleanResponse.substring(0, 500),
@@ -1169,7 +1178,7 @@ const parseSmartResponse = (response, context) => {
     const hebrewMatch = cleanResponse.match(/[\u0590-\u05FF][^"{}]*/g);
     if (hebrewMatch && hebrewMatch.length > 0) {
       const combinedHebrew = hebrewMatch.join(' ').substring(0, 300);
-      console.log('✅ Extracted Hebrew text:', combinedHebrew.substring(0, 50));
+      devLog('✅ Extracted Hebrew text:', combinedHebrew.substring(0, 50));
       return {
         intent: INTENTS.GENERAL_CHAT,
         response: combinedHebrew,
@@ -1208,7 +1217,7 @@ const tryBuildFoodAction = (jsonText, responseText) => {
           };
         }
       } catch (e) {
-        console.log('Foods array parse failed');
+        devLog('Foods array parse failed');
       }
     }
     
@@ -1230,7 +1239,7 @@ const tryBuildFoodAction = (jsonText, responseText) => {
         fat: fatMatch ? parseFloat(fatMatch[1]) : 0,
       };
       
-      console.log('✅ Built food action from response:', food.name, food.calories);
+      devLog('✅ Built food action from response:', food.name, food.calories);
       return {
         type: 'add_food',
         data: { foods: [food] }
@@ -1239,7 +1248,7 @@ const tryBuildFoodAction = (jsonText, responseText) => {
     
     return null;
   } catch (e) {
-    console.log('tryBuildFoodAction error:', e.message);
+    devLog('tryBuildFoodAction error:', e.message);
     return null;
   }
 };

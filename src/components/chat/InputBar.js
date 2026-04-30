@@ -6,6 +6,7 @@ import {
   TouchableOpacity,
   StyleSheet,
   Platform,
+  ActivityIndicator,
 } from 'react-native';
 import Animated, {
   useSharedValue,
@@ -15,6 +16,8 @@ import Animated, {
   Extrapolate,
 } from 'react-native-reanimated';
 import { LinearGradient } from 'expo-linear-gradient';
+import GrayIconChip from './GrayIconChip';
+import { SHOW_CHAT_CAMERA_CAPTURE_IN_UI } from '../../constants/featureFlags';
 
 const AnimatedTouchable = Animated.createAnimatedComponent(TouchableOpacity);
 
@@ -32,9 +35,21 @@ function InputBar({
   onWater,
   onFocus,
   onDailyPlanPress,
+  /** ניווט למסך ברכות (למשל BirkatHamazon) */
+  onBrachotPress,
   on3DPress,
+  disabled = false,
+  disabledReason = '',
+  /** Locks input + side actions while the bot is working (no banner). */
+  isBusy = false,
+  /** When true with `onStop`, action button becomes stop (cancels generation). */
+  canStop = false,
+  onStop,
 }) {
   const showSendBtn = inputText?.trim()?.length > 0;
+  const hardDisabled = disabled;
+  const softBusy = isBusy && !hardDisabled;
+  const inputLocked = hardDisabled || softBusy;
   const inputRef = React.useRef(null);
 
   const containerProgress = useSharedValue(0);
@@ -60,28 +75,78 @@ function InputBar({
   }));
 
   const handleSend = () => {
+    if (hardDisabled) return;
+    if (softBusy) return;
     if (showSendBtn) {
       onSend?.();
     }
   };
 
   const handleWater = () => {
+    if (hardDisabled) return;
+    if (softBusy) return;
     onWater?.();
+  };
+
+  const handleStop = () => {
+    onStop?.();
   };
 
   return (
     <Animated.View style={[styles.container, containerStyle]}>
-      <View style={styles.inputCard}>
-        {/* Daily Plan Button - Calendar icon */}
+      {hardDisabled && disabledReason ? (
+        <View style={styles.disabledBanner}>
+          <Text style={styles.disabledBannerText}>{disabledReason}</Text>
+        </View>
+      ) : null}
+      <View style={[styles.inputCard, hardDisabled && styles.inputCardDisabled, softBusy && styles.inputCardBusy]}>
+        {/* תפריט מתוכנן (תכנון ארוחות יומי בצ'אט) */}
         {onDailyPlanPress && (
           <TouchableOpacity
             style={styles.iconBtn}
-            onPress={onDailyPlanPress}
+            onPress={inputLocked ? undefined : onDailyPlanPress}
             activeOpacity={0.7}
+            disabled={inputLocked}
+            accessibilityLabel="תפריט מתוכנן"
+            accessibilityRole="button"
           >
-            <View style={styles.planBtn}>
-              <Text style={styles.planIcon}>📋</Text>
-            </View>
+            <GrayIconChip size={36}>
+              <Text
+                style={styles.dailyPlanLabel}
+                numberOfLines={2}
+                allowFontScaling={false}
+                adjustsFontSizeToFit
+                minimumFontScale={0.75}
+                textAlign="center"
+              >
+                {`תפריט\nמתוכנן`}
+              </Text>
+            </GrayIconChip>
+          </TouchableOpacity>
+        )}
+
+        {/* מה לברך — מסך ברכות */}
+        {onBrachotPress && (
+          <TouchableOpacity
+            style={styles.iconBtn}
+            onPress={inputLocked ? undefined : onBrachotPress}
+            activeOpacity={0.7}
+            disabled={inputLocked}
+            accessibilityLabel="מה לברך"
+            accessibilityRole="button"
+          >
+            <GrayIconChip size={36}>
+              <Text
+                style={styles.dailyPlanLabel}
+                numberOfLines={2}
+                allowFontScaling={false}
+                adjustsFontSizeToFit
+                minimumFontScale={0.75}
+                textAlign="center"
+              >
+                {`מה\nלברך`}
+              </Text>
+            </GrayIconChip>
           </TouchableOpacity>
         )}
 
@@ -89,23 +154,31 @@ function InputBar({
         {on3DPress && (
           <TouchableOpacity
             style={styles.iconBtn}
-            onPress={on3DPress}
+            onPress={inputLocked ? undefined : on3DPress}
             activeOpacity={0.7}
+            disabled={inputLocked}
           >
-            <View style={styles.threeDBtn}>
+            <GrayIconChip>
               <Text style={styles.threeDText}>3D</Text>
-            </View>
+            </GrayIconChip>
           </TouchableOpacity>
         )}
 
-        {/* Camera Button */}
-        <TouchableOpacity
-          style={styles.iconBtn}
-          onPress={onCameraPress}
-          activeOpacity={0.7}
-        >
-          <Text style={styles.cameraIcon}>📷</Text>
-        </TouchableOpacity>
+        {/* כפתור המצלמה — מוגדר ב-featureFlags; הקוד נשמר, לא מוצג כשהדגל כבוי */}
+        {SHOW_CHAT_CAMERA_CAPTURE_IN_UI && onCameraPress ? (
+          <TouchableOpacity
+            style={styles.iconBtn}
+            onPress={inputLocked ? undefined : onCameraPress}
+            activeOpacity={0.7}
+            disabled={inputLocked}
+            accessibilityLabel="צילום ארוחה"
+            accessibilityRole="button"
+          >
+            <GrayIconChip>
+              <Text style={styles.cameraIcon}>📷</Text>
+            </GrayIconChip>
+          </TouchableOpacity>
+        ) : null}
 
         {/* Input Field */}
         <View style={styles.inputWrapper}>
@@ -114,39 +187,68 @@ function InputBar({
             style={styles.input}
             value={inputText}
             onChangeText={onChangeText}
-            placeholder="ספר לי מה אכלת..."
+            placeholder={inputLocked ? 'רגע...' : 'ספר לי מה אכלת...'}
             placeholderTextColor="#9CA3AF"
             onSubmitEditing={handleSend}
             onFocus={onFocus}
             multiline
             maxLength={200}
             returnKeyType="send"
-            autoCorrect={false}
-            autoComplete="off"
-            spellCheck={false}
             autoCapitalize="none"
+            editable={!inputLocked}
           />
         </View>
 
-        {/* Action Button - Send or Water */}
-        <AnimatedTouchable
-          style={[styles.actionBtn, actionBtnStyle]}
-          onPress={showSendBtn ? handleSend : handleWater}
-          activeOpacity={0.8}
-        >
-          {showSendBtn ? (
-            <LinearGradient
-              colors={['#22C55E', '#16A34A']}
-              style={styles.sendBtnGradient}
-            >
-              <Text style={styles.sendIcon}>↑</Text>
-            </LinearGradient>
-          ) : (
-            <View style={styles.waterBtn}>
-              <Text style={styles.waterIcon}>💧</Text>
-            </View>
-          )}
-        </AnimatedTouchable>
+        {/* Action: stop (generation) / send / water */}
+        {softBusy && canStop && onStop ? (
+          <TouchableOpacity
+            style={[styles.actionBtn, styles.stopBtn]}
+            onPress={handleStop}
+            activeOpacity={0.85}
+            accessibilityLabel="עצור"
+          >
+            <View style={styles.stopIconSquare} />
+          </TouchableOpacity>
+        ) : (
+          <AnimatedTouchable
+            style={[
+              styles.actionBtn,
+              actionBtnStyle,
+              hardDisabled && styles.actionBtnDisabled,
+              softBusy && styles.actionBtnBusy,
+            ]}
+            onPress={
+              hardDisabled || softBusy
+                ? undefined
+                : (showSendBtn ? handleSend : handleWater)
+            }
+            activeOpacity={hardDisabled || softBusy ? 1 : 0.8}
+            disabled={hardDisabled || softBusy}
+          >
+            {softBusy ? (
+              <View style={styles.busyActionInner}>
+                <ActivityIndicator size="small" color="#6B7280" />
+              </View>
+            ) : showSendBtn ? (
+              hardDisabled ? (
+                <View style={styles.sendBtnDisabled}>
+                  <Text style={styles.sendIconDisabled}>↑</Text>
+                </View>
+              ) : (
+                <LinearGradient
+                  colors={['#22C55E', '#16A34A']}
+                  style={styles.sendBtnGradient}
+                >
+                  <Text style={styles.sendIcon}>↑</Text>
+                </LinearGradient>
+              )
+            ) : (
+              <View style={[styles.waterBtn, hardDisabled && styles.waterBtnDisabled]}>
+                <Text style={styles.waterIcon}>💧</Text>
+              </View>
+            )}
+          </AnimatedTouchable>
+        )}
       </View>
     </Animated.View>
   );
@@ -158,7 +260,8 @@ const styles = StyleSheet.create({
   container: {
     paddingHorizontal: 12,
     paddingTop: 6,
-    paddingBottom: Platform.OS === 'ios' ? 24 : 10,
+    // Tight bottom — Home shows the AI disclaimer strip below; extra iOS inset not needed here
+    paddingBottom: Platform.OS === 'ios' ? 6 : 6,
     backgroundColor: '#FFFFFF',
     borderTopWidth: 1,
     borderTopColor: '#E5E7EB',
@@ -187,28 +290,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
-  planBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#F0FDF4',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#BBF7D0',
-  },
-  planIcon: {
-    fontSize: 16,
-  },
-  threeDBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#F3F4F6',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 1,
-    borderColor: '#E5E7EB',
+  dailyPlanLabel: {
+    color: '#374151',
+    fontWeight: '600',
+    fontSize: 8,
+    lineHeight: 8.6,
+    textAlign: 'center',
+    paddingHorizontal: 1,
+    width: '100%',
   },
   threeDText: {
     fontSize: 11,
@@ -262,5 +351,70 @@ const styles = StyleSheet.create({
   },
   waterIcon: {
     fontSize: 20,
+  },
+  disabledBanner: {
+    marginHorizontal: 4,
+    marginBottom: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: '#FEF3C7',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+    alignItems: 'center',
+  },
+  disabledBannerText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#92400E',
+    textAlign: 'center',
+  },
+  inputCardDisabled: {
+    opacity: 0.55,
+  },
+  actionBtnDisabled: {
+    opacity: 0.6,
+  },
+  sendBtnDisabled: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: '#D1D5DB',
+  },
+  sendIconDisabled: {
+    fontSize: 20,
+    color: '#FFFFFF',
+    fontWeight: '700',
+  },
+  waterBtnDisabled: {
+    backgroundColor: '#F3F4F6',
+    borderColor: '#E5E7EB',
+  },
+  inputCardBusy: {
+    opacity: 0.95,
+  },
+  actionBtnBusy: {
+    backgroundColor: '#F3F4F6',
+  },
+  busyActionInner: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  stopBtn: {
+    backgroundColor: '#F97316',
+    borderRadius: 20,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#EA580C',
+  },
+  stopIconSquare: {
+    width: 11,
+    height: 11,
+    borderRadius: 1.5,
+    backgroundColor: '#FFFFFF',
   },
 });

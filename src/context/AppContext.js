@@ -10,7 +10,14 @@
  * When data is ready → isLoading = false.
  */
 
-import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import React, {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+} from 'react';
 import moment from 'moment';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import {
@@ -25,10 +32,16 @@ import {
   saveMeal,
   deleteMeal,
   updateMeal,
+  insertWaterLog,
+  insertWeightLog,
 } from '../api/supabaseClient';
 
-// Keep base44 for AI functions (OpenAI)
+// Keep base44 for AI helpers (Gemini via aiClient → gemini-proxy)
 import { base44 } from '../api/base44Client';
+
+const devLog = (...args) => {
+  if (__DEV__) console.log(...args);
+};
 
 const AppContext = createContext();
 
@@ -52,6 +65,19 @@ const getTodayWithReset = () => {
   return moment().format('YYYY-MM-DD');
 };
 
+/** Sum kcal / macros from meal rows (authoritative for daily balance). */
+function aggregateMacrosFromMealRows(mealList) {
+  return (mealList || []).reduce(
+    (acc, m) => ({
+      calories: acc.calories + (Number(m.calories) || 0),
+      protein: acc.protein + (Number(m.protein) || 0),
+      fat: acc.fat + (Number(m.fat) || 0),
+      carbs: acc.carbs + (Number(m.carbs) || 0),
+    }),
+    { calories: 0, protein: 0, fat: 0, carbs: 0 }
+  );
+}
+
 export const AppProvider = ({ children, session }) => {
   const user = session?.user || null;
   const today = getTodayWithReset();
@@ -62,6 +88,7 @@ export const AppProvider = ({ children, session }) => {
     calories: 0,
     protein: 0,
     fat: 0,
+    carbs: 0,
     water_glasses: 0
   });
   const [messages, setMessages] = useState([]);
@@ -72,6 +99,59 @@ export const AppProvider = ({ children, session }) => {
   // Prevent race conditions
   const loadingRef = useRef(null);
   const isMountedRef = useRef(true);
+  /** Latest daily stats for merges (avoids stale closure on rapid updates). */
+  const dailyStatsRef = useRef(dailyStats);
+  useEffect(() => {
+    dailyStatsRef.current = dailyStats;
+  }, [dailyStats]);
+
+  /** Recalculate kcal/macros from today's meals list; preserves water_glasses row. */
+  const syncDailyMacrosFromMealsDb = useCallback(
+    async (loadIdCheck) => {
+      if (!user?.id || !isMountedRef.current) return;
+      if (loadIdCheck != null && loadingRef.current !== loadIdCheck) return;
+      try {
+        const { data: mealRows, error: mealErr } = await getMealsByDate(user.id, today);
+        if (mealErr) devLog('[AppContext] getMealsByDate (sync):', mealErr.message);
+        const { data: dsRow } = await getDailyStat(user.id, today);
+
+        const agg = aggregateMacrosFromMealRows(mealRows || []);
+        const water =
+          dsRow?.water ??
+          dailyStatsRef.current?.water_glasses ??
+          0;
+
+        const next = {
+          id: dsRow?.id ?? dailyStatsRef.current?.id,
+          calories: Math.max(0, Math.round(agg.calories)),
+          protein: Math.max(0, Math.round(agg.protein * 10) / 10),
+          fat: Math.max(0, Math.round(agg.fat * 10) / 10),
+          carbs: Math.max(0, Math.round(agg.carbs * 10) / 10),
+          water_glasses:
+            typeof water === 'number' ? water : Number(water) || 0,
+        };
+
+        if (!isMountedRef.current) return;
+        if (loadIdCheck != null && loadingRef.current !== loadIdCheck) return;
+
+        dailyStatsRef.current = next;
+        setDailyStatsState(next);
+        setMeals(mealRows || []);
+
+        const { error } = await saveDailyStat(user.id, today, {
+          calories: next.calories,
+          protein: next.protein,
+          fat: next.fat,
+          carbs: next.carbs,
+          water: next.water_glasses,
+        });
+        if (error) console.error('[AppContext] sync daily stats save:', error);
+      } catch (e) {
+        devLog('[AppContext] syncDailyMacrosFromMealsDb:', e?.message || e);
+      }
+    },
+    [user?.id, today]
+  );
 
   // ================================================
   // LOAD USER DATA ON MOUNT
@@ -80,10 +160,10 @@ export const AppProvider = ({ children, session }) => {
     isMountedRef.current = true;
     
     if (user?.id) {
-      console.log('[AppContext] Session received, loading data for:', user.email);
+      devLog('[AppContext] Session received, loading data for:', user.email);
       loadUserData(user.id);
     } else {
-      console.log('[AppContext] No user, setting loading to false');
+      devLog('[AppContext] No user, setting loading to false');
       setIsLoading(false);
     }
 
@@ -104,7 +184,7 @@ export const AppProvider = ({ children, session }) => {
     const loadId = Date.now();
     loadingRef.current = loadId;
     
-    console.log('[AppContext] Starting data load for user:', userId);
+    devLog('[AppContext] Starting data load for user:', userId);
 
     try {
       // Load profile
@@ -112,15 +192,15 @@ export const AppProvider = ({ children, session }) => {
       
       // Check if still valid load
       if (loadingRef.current !== loadId || !isMountedRef.current) {
-        console.log('[AppContext] Load cancelled - newer load in progress');
+        devLog('[AppContext] Load cancelled - newer load in progress');
         return;
       }
 
       if (profileError) {
-        console.log('[AppContext] Profile error:', profileError.message);
+        devLog('[AppContext] Profile error:', profileError.message);
       }
 
-      console.log('[AppContext] Profile loaded:', profileData ? 'EXISTS' : 'NULL');
+      devLog('[AppContext] Profile loaded:', profileData ? 'EXISTS' : 'NULL');
       
       // Determine if onboarding is complete
       const isOnboardingDone = checkOnboardingComplete(profileData);
@@ -132,43 +212,20 @@ export const AppProvider = ({ children, session }) => {
 
       // If onboarding not done, stop loading here
       if (!isOnboardingDone) {
-        console.log('[AppContext] Onboarding not complete, showing onboarding screen');
+        devLog('[AppContext] Onboarding not complete, showing onboarding screen');
         setIsLoading(false);
         return;
       }
 
-      // Load daily stats
-      try {
-        const { data: statsData } = await getDailyStat(userId, today);
-        if (statsData && loadingRef.current === loadId && isMountedRef.current) {
-          setDailyStatsState({
-            id: statsData.id,
-            calories: statsData.calories || 0,
-            protein: statsData.protein || 0,
-            fat: statsData.fat || 0,
-            water_glasses: statsData.water || 0,
-          });
-          console.log('[AppContext] Daily stats loaded:', statsData.calories, 'cal');
-        }
-      } catch (statsError) {
-        console.log('[AppContext] Stats load error:', statsError.message);
-      }
-
-      // Load today's meals
-      try {
-        const { data: mealsData } = await getMealsByDate(userId, today);
-        if (mealsData && mealsData.length > 0 && loadingRef.current === loadId && isMountedRef.current) {
-          setMeals(mealsData);
-          console.log('[AppContext] Meals loaded:', mealsData.length, 'items');
-        }
-      } catch (mealsError) {
-        console.log('[AppContext] Meals load error:', mealsError.message);
+      // Daily macros + meals: single source of truth = sum of `meals` rows for today
+      if (loadingRef.current === loadId && isMountedRef.current) {
+        await syncDailyMacrosFromMealsDb(loadId);
       }
 
       // Chat messages are NOT loaded from DB - fresh chat on every app open
-      console.log('[AppContext] Chat starts fresh (no history loaded)');
+      devLog('[AppContext] Chat starts fresh (no history loaded)');
 
-      console.log('[AppContext] ✅ Data loading complete!');
+      devLog('[AppContext] ✅ Data loading complete!');
 
     } catch (error) {
       console.error('[AppContext] Error loading data:', error);
@@ -206,19 +263,28 @@ export const AppProvider = ({ children, session }) => {
   // PROFILE FUNCTIONS
   // ================================================
   const setProfile = async (newProfile) => {
+    const previousWeight = profile?.weight_kg;
     const profileWithEmail = {
       ...newProfile,
       email: user?.email || null,
       onboarding_completed: true,
     };
 
-    console.log('[AppContext] Saving profile...');
+    devLog('[AppContext] Saving profile...');
     setProfileState(profileWithEmail);
     setHasCompletedOnboarding(true);
 
     if (user) {
       const result = await saveUserProfile(user.id, profileWithEmail);
-      console.log('[AppContext] Profile saved:', result.error ? 'ERROR' : 'SUCCESS');
+      devLog('[AppContext] Profile saved:', result.error ? 'ERROR' : 'SUCCESS');
+      const w = newProfile?.weight_kg;
+      if (!result?.error && w != null && Number(w) > 0 && w !== previousWeight) {
+        try {
+          await insertWeightLog(user.id, today, Number(w), 'profile');
+        } catch (e) {
+          devLog('[AppContext] insertWeightLog:', e?.message || e);
+        }
+      }
       return result;
     }
     return { data: profileWithEmail, error: null };
@@ -228,30 +294,33 @@ export const AppProvider = ({ children, session }) => {
   // DAILY STATS FUNCTIONS
   // ================================================
   const setDailyStats = async (newStats) => {
-    console.log('[AppContext] setDailyStats called with:', newStats);
-    const updatedStats = { ...dailyStats, ...newStats };
-    console.log('[AppContext] Updated stats:', updatedStats);
+    devLog('[AppContext] setDailyStats called with:', newStats);
+    const updatedStats = { ...dailyStatsRef.current, ...newStats };
+    devLog('[AppContext] Updated stats:', updatedStats);
+    dailyStatsRef.current = updatedStats;
     setDailyStatsState(updatedStats);
-    
+
     if (user) {
       const { error } = await saveDailyStat(user.id, today, {
         calories: updatedStats.calories,
         protein: updatedStats.protein,
         fat: updatedStats.fat,
+        carbs: updatedStats.carbs ?? 0,
         water: updatedStats.water_glasses,
       });
       if (error) {
         console.error('[AppContext] Error saving daily stats:', error);
       } else {
-        console.log('[AppContext] Daily stats saved successfully to Supabase');
+        devLog('[AppContext] Daily stats saved successfully to Supabase');
       }
     }
   };
 
   const updateStat = async (statName, value) => {
-    const newStats = { ...dailyStats, [statName]: value };
+    const newStats = { ...dailyStatsRef.current, [statName]: value };
+    dailyStatsRef.current = newStats;
     setDailyStatsState(newStats);
-    
+
     if (user) {
       const dbField = statName === 'water_glasses' ? 'water' : statName;
       await saveDailyStat(user.id, today, { [dbField]: value });
@@ -270,7 +339,7 @@ export const AppProvider = ({ children, session }) => {
         const savedMessages = await AsyncStorage.getItem(MESSAGES_STORAGE_KEY);
         if (savedMessages) {
           const parsed = JSON.parse(savedMessages);
-          console.log('[AppContext] Loaded', parsed.length, 'messages from storage');
+          devLog('[AppContext] Loaded', parsed.length, 'messages from storage');
           setMessages(parsed);
         }
       } catch (error) {
@@ -315,7 +384,7 @@ export const AppProvider = ({ children, session }) => {
     setMessages([]);
     try {
       await AsyncStorage.removeItem(MESSAGES_STORAGE_KEY);
-      console.log('[AppContext] Messages cleared from storage');
+      devLog('[AppContext] Messages cleared from storage');
     } catch (error) {
       console.error('[AppContext] Error clearing messages:', error);
     }
@@ -326,88 +395,57 @@ export const AppProvider = ({ children, session }) => {
   // ================================================
   const addMeal = async (mealData, skipStatsUpdate = false) => {
     if (!user) {
-      console.log('[AppContext] addMeal: No user, skipping');
+      devLog('[AppContext] addMeal: No user, skipping');
       return;
     }
 
-    console.log('[AppContext] addMeal: Saving meal:', mealData.name, 'date:', today);
+    devLog('[AppContext] addMeal: Saving meal:', mealData.name, 'date:', today);
     
     const { data: newMeal, error } = await saveMeal(user.id, {
       ...mealData,
       date: today,
+      source: mealData.source || 'manual',
     });
 
     if (error) {
-      console.log('[AppContext] addMeal: Error saving meal:', error);
+      devLog('[AppContext] addMeal: Error saving meal:', error);
       return;
     }
 
-    console.log('[AppContext] addMeal: Saved successfully:', newMeal?.id, newMeal?.name);
+    devLog('[AppContext] addMeal: Saved successfully:', newMeal?.id, newMeal?.name);
 
     if (newMeal) {
-      setMeals(prev => {
-        console.log('[AppContext] addMeal: Updating meals state, prev count:', prev.length);
-        return [newMeal, ...prev];
-      });
-
-      // Update daily stats (unless skipped - when batch processing)
       if (!skipStatsUpdate) {
-        const newCalories = dailyStats.calories + (mealData.calories || 0);
-        const newProtein = dailyStats.protein + (mealData.protein || 0);
-        const newFat = dailyStats.fat + (mealData.fat || 0);
-
-        await setDailyStats({
-          calories: newCalories,
-          protein: newProtein,
-          fat: newFat,
-          water_glasses: dailyStats.water_glasses,
+        await syncDailyMacrosFromMealsDb();
+      } else {
+        setMeals((prev) => {
+          devLog('[AppContext] addMeal: Updating meals state, prev count:', prev.length);
+          return [newMeal, ...prev];
         });
       }
     }
   };
 
   const removeMeal = async (mealId) => {
-    const meal = meals.find(m => m.id === mealId);
-    if (!meal) return;
+    if (!user) return;
 
-    await deleteMeal(mealId);
-    setMeals(prev => prev.filter(m => m.id !== mealId));
+    const { error: delErr } = await deleteMeal(mealId);
+    if (delErr) {
+      devLog('[AppContext] removeMeal delete:', delErr);
+      return;
+    }
 
-    // Update daily stats
-    const newCalories = Math.max(0, dailyStats.calories - (meal.calories || 0));
-    const newProtein = Math.max(0, dailyStats.protein - (meal.protein || 0));
-    const newFat = Math.max(0, dailyStats.fat - (meal.fat || 0));
-
-    await setDailyStats({
-      calories: newCalories,
-      protein: newProtein,
-      fat: newFat,
-      water_glasses: dailyStats.water_glasses,
-    });
+    await syncDailyMacrosFromMealsDb();
   };
 
   const editMeal = async (mealId, updatedData) => {
-    const originalMeal = meals.find(m => m.id === mealId);
+    const originalMeal = meals.find((m) => m.id === mealId);
     if (!originalMeal) return;
 
-    // Update in database
     const { data: updatedMeal } = await updateMeal(mealId, updatedData);
-    
+
     if (updatedMeal) {
-      // Update local state
-      setMeals(prev => prev.map(m => m.id === mealId ? { ...m, ...updatedData } : m));
-
-      // Calculate difference and update daily stats
-      const caloriesDiff = (updatedData.calories || 0) - (originalMeal.calories || 0);
-      const proteinDiff = (updatedData.protein || 0) - (originalMeal.protein || 0);
-      const fatDiff = (updatedData.fat || 0) - (originalMeal.fat || 0);
-
-      await setDailyStats({
-        calories: Math.max(0, dailyStats.calories + caloriesDiff),
-        protein: Math.max(0, dailyStats.protein + proteinDiff),
-        fat: Math.max(0, dailyStats.fat + fatDiff),
-        water_glasses: dailyStats.water_glasses,
-      });
+      await syncDailyMacrosFromMealsDb();
     }
   };
 
@@ -415,8 +453,15 @@ export const AppProvider = ({ children, session }) => {
   // WATER FUNCTIONS
   // ================================================
   const addWater = async (glasses = 1) => {
-    const newWater = (dailyStats.water_glasses || 0) + glasses;
+    const newWater = (dailyStatsRef.current?.water_glasses || 0) + glasses;
     await updateStat('water_glasses', newWater);
+    if (user?.id) {
+      try {
+        await insertWaterLog(user.id, today, glasses);
+      } catch (e) {
+        devLog('[AppContext] insertWaterLog:', e?.message || e);
+      }
+    }
     return newWater;
   };
 
@@ -424,14 +469,14 @@ export const AppProvider = ({ children, session }) => {
   // LOGOUT FUNCTION
   // ================================================
   const logout = async () => {
-    console.log('[AppContext] Logging out...');
+    devLog('[AppContext] Logging out...');
     
     try {
       // Sign out from Supabase - this will trigger SIGNED_OUT event in App.js
       await supabase.auth.signOut();
-      console.log('[AppContext] Supabase signOut successful');
+      devLog('[AppContext] Supabase signOut successful');
     } catch (error) {
-      console.log('[AppContext] Logout error:', error);
+      devLog('[AppContext] Logout error:', error);
     }
   };
 
@@ -476,7 +521,7 @@ export const AppProvider = ({ children, session }) => {
     // Refresh data
     refreshData: () => user && loadUserData(user.id),
 
-    // AI integrations (OpenAI via base44)
+    // AI integrations (Gemini via base44)
     ai: base44.integrations.Core,
   };
 

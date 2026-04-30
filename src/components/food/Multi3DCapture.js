@@ -6,12 +6,12 @@ import {
   TouchableOpacity,
   Image,
   Dimensions,
-  SafeAreaView,
   Alert,
   Platform,
   Keyboard,
   Modal,
 } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { Ionicons } from '@expo/vector-icons';
 import Animated, {

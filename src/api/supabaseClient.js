@@ -3,6 +3,7 @@ import { createClient } from '@supabase/supabase-js';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as FileSystem from 'expo-file-system';
 import { decode } from 'base64-arraybuffer';
+import Constants from 'expo-constants';
 import { LogBox } from 'react-native';
 
 // Ignore refresh token errors in LogBox (they're handled gracefully)
@@ -13,9 +14,21 @@ LogBox.ignoreLogs([
   'AuthApiError',
 ]);
 
-// Supabase Configuration
-const SUPABASE_URL = 'https://xnynrlctilanhcexkfse.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhueW5ybGN0aWxhbmhjZXhrZnNlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjUzNzY0MjQsImV4cCI6MjA4MDk1MjQyNH0.kqfMtay640UI031KD171-Lw7zG8UYkVM9W65zRfHb9U';
+// Supabase Configuration — prefer EXPO_PUBLIC_* in .env (see .env.example).
+// Fallback preserves local dev when env is not set.
+const FALLBACK_SUPABASE_URL = 'https://xnynrlctilanhcexkfse.supabase.co';
+const FALLBACK_SUPABASE_ANON_KEY =
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhueW5ybGN0aWxhbmhjZXhrZnNlIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjUzNzY0MjQsImV4cCI6MjA4MDk1MjQyNH0.kqfMtay640UI031KD171-Lw7zG8UYkVM9W65zRfHb9U';
+
+/** Exported for Edge Function calls via fetch (RN is flaky with `functions.invoke`). */
+export const SUPABASE_URL =
+  process.env.EXPO_PUBLIC_SUPABASE_URL?.trim() ||
+  Constants.expoConfig?.extra?.supabaseUrl?.trim() ||
+  FALLBACK_SUPABASE_URL;
+export const SUPABASE_ANON_KEY =
+  process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY?.trim() ||
+  Constants.expoConfig?.extra?.supabaseAnonKey?.trim() ||
+  FALLBACK_SUPABASE_ANON_KEY;
 
 export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: {
@@ -27,27 +40,8 @@ export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   },
 });
 
-// Global handler for auth state changes
-// ⚠️ NEVER auto-logout! User stays logged in until explicit logout
-supabase.auth.onAuthStateChange(async (event, session) => {
-  console.log('[Supabase] Auth event:', event, session ? 'with session' : 'no session');
-  
-  if (event === 'SIGNED_IN') {
-    console.log('[Supabase] User signed in:', session?.user?.email);
-  }
-  if (event === 'TOKEN_REFRESHED') {
-    if (session) {
-      console.log('[Supabase] Token refreshed successfully');
-    } else {
-      // Token refresh failed, but DON'T logout! Just log it
-      console.log('[Supabase] Token refresh returned no session, but keeping user logged in');
-    }
-  }
-  if (event === 'SIGNED_OUT') {
-    console.log('[Supabase] User explicitly signed out');
-  }
-  // ⚠️ Never call clearInvalidSession() automatically here!
-});
+// Auth events are handled in App.js (single listener). Do not register a second
+// onAuthStateChange here — it duplicated TOKEN_REFRESHED logs and console noise.
 
 // Helper to clear invalid sessions without throwing errors
 export const clearInvalidSession = async () => {
@@ -59,38 +53,38 @@ export const clearInvalidSession = async () => {
       await AsyncStorage.multiRemove(supabaseKeys);
     }
     await supabase.auth.signOut();
-    console.log('[Supabase] Session cleared');
+    if (__DEV__) console.log('[Supabase] Session cleared');
   } catch (e) {
     // Silently ignore
-    console.log('[Supabase] Error clearing session:', e);
+    if (__DEV__) console.log('[Supabase] Error clearing session:', e);
   }
 };
 
 // Helper to refresh session - tries multiple methods
 export const refreshSession = async () => {
-  console.log('[Supabase] Attempting session refresh...');
+  if (__DEV__) console.log('[Supabase] Attempting session refresh...');
   
   // Method 1: Try standard refresh
   try {
     const { data, error } = await supabase.auth.refreshSession();
     if (!error && data?.session) {
-      console.log('[Supabase] Session refreshed via refreshSession()');
+      if (__DEV__) console.log('[Supabase] Session refreshed via refreshSession()');
       return data.session;
     }
-    console.log('[Supabase] Standard refresh failed:', error?.message);
+    if (__DEV__) console.log('[Supabase] Standard refresh failed:', error?.message);
   } catch (e) {
-    console.log('[Supabase] Standard refresh error:', e.message);
+    if (__DEV__) console.log('[Supabase] Standard refresh error:', e.message);
   }
   
   // Method 2: Try to get existing session
   try {
     const { data: { session }, error } = await supabase.auth.getSession();
     if (!error && session) {
-      console.log('[Supabase] Found existing session');
+      if (__DEV__) console.log('[Supabase] Found existing session');
       return session;
     }
   } catch (e) {
-    console.log('[Supabase] getSession error:', e.message);
+    if (__DEV__) console.log('[Supabase] getSession error:', e.message);
   }
   
   // Method 3: Try to recover from AsyncStorage directly
@@ -99,23 +93,73 @@ export const refreshSession = async () => {
     if (storedSession) {
       const parsed = JSON.parse(storedSession);
       if (parsed?.currentSession?.access_token) {
-        console.log('[Supabase] Found session in AsyncStorage, attempting to set...');
+        if (__DEV__) console.log('[Supabase] Found session in AsyncStorage, attempting to set...');
         const { data, error } = await supabase.auth.setSession({
           access_token: parsed.currentSession.access_token,
           refresh_token: parsed.currentSession.refresh_token || '',
         });
         if (!error && data?.session) {
-          console.log('[Supabase] Session recovered from storage!');
+          if (__DEV__) console.log('[Supabase] Session recovered from storage!');
           return data.session;
         }
       }
     }
   } catch (e) {
-    console.log('[Supabase] Storage recovery failed:', e.message);
+    if (__DEV__) console.log('[Supabase] Storage recovery failed:', e.message);
   }
   
-  console.log('[Supabase] All refresh methods failed, but NOT logging out');
+  if (__DEV__) console.log('[Supabase] All refresh methods failed, but NOT logging out');
   return null;
+};
+
+// ============ Account Deletion ============
+// Calls the `delete-account` Edge Function with the caller's JWT,
+// which permanently removes:
+//   • all Storage objects under images/<userId>/
+//   • the auth.users row (cascades to user_profiles, daily_stats,
+//     meals, chat_messages, saved_recipes, api_usage)
+// Required for Apple App Store Guideline 5.1.1(v).
+export const deleteAccount = async () => {
+  try {
+    const { data: sessionData, error: sessionError } =
+      await supabase.auth.getSession();
+    if (sessionError || !sessionData?.session?.access_token) {
+      return { error: 'no_session' };
+    }
+
+    const accessToken = sessionData.session.access_token;
+    const url = `${SUPABASE_URL}/functions/v1/delete-account`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        apikey: SUPABASE_ANON_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+
+    let body = null;
+    try {
+      body = await response.json();
+    } catch {
+      body = null;
+    }
+
+    if (!response.ok) {
+      if (__DEV__) console.log('[Supabase] deleteAccount failed:', response.status, body);
+      return {
+        error: body?.error || `http_${response.status}`,
+        message: body?.message,
+      };
+    }
+
+    return { ok: true, removed_files: body?.removed_files ?? 0 };
+  } catch (e) {
+    if (__DEV__) console.log('[Supabase] deleteAccount threw:', e?.message || e);
+    return { error: 'network_error', message: e?.message };
+  }
 };
 
 // ============ Storage Functions ============
@@ -266,7 +310,7 @@ export const saveUserProfile = async (userId, profileData, retryCount = 0) => {
     // Verify user is authenticated first
     const { data: { user } } = await supabase.auth.getUser();
     if (!user || user.id !== userId) {
-      console.log('User mismatch or not authenticated, using current session user');
+      if (__DEV__) console.log('User mismatch or not authenticated, using current session user');
       if (user) {
         userId = user.id; // Use the actual authenticated user ID
       } else {
@@ -291,7 +335,7 @@ export const saveUserProfile = async (userId, profileData, retryCount = 0) => {
     
     // Retry on foreign key violation (user might not be propagated yet)
     if (error.code === '23503' && retryCount < MAX_RETRIES) {
-      console.log(`Retrying save profile... (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+      if (__DEV__) console.log(`Retrying save profile... (attempt ${retryCount + 1}/${MAX_RETRIES})`);
       await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
       return saveUserProfile(userId, profileData, retryCount + 1);
     }
@@ -377,12 +421,99 @@ export const getDailyStatsHistory = async (userId, limit = 30) => {
   }
 };
 
+/** ארוחות מיום התחלה (כולל) — לניתוח AI ודפוסי זמן */
+export const getMealsSince = async (userId, startDate) => {
+  try {
+    const { data, error } = await supabase
+      .from('meals')
+      .select('id, name, calories, protein, fat, carbs, meal_type, date, created_at, source, image_url, eaten_at')
+      .eq('user_id', userId)
+      .gte('date', startDate)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    return { data: data || [], error: null };
+  } catch (error) {
+    console.error('Get meals since error:', error);
+    return { data: [], error };
+  }
+};
+
+/** דיווחי מים לפי טווח תאריכים (יום אפליקציה) */
+export const getWaterLogsSince = async (userId, startDate) => {
+  try {
+    const { data, error } = await supabase
+      .from('water_logs')
+      .select('id, day_date, logged_at, glasses')
+      .eq('user_id', userId)
+      .gte('day_date', startDate)
+      .order('logged_at', { ascending: false });
+
+    if (error) throw error;
+    return { data: data || [], error: null };
+  } catch (error) {
+    console.error('Get water logs error:', error);
+    return { data: [], error };
+  }
+};
+
+export const insertWaterLog = async (userId, dayDate, glasses = 1) => {
+  try {
+      const { error } = await supabase.from('water_logs').insert({
+      user_id: userId,
+      day_date: dayDate,
+      logged_at: new Date().toISOString(),
+      glasses,
+    });
+    if (error) throw error;
+    return { error: null };
+  } catch (error) {
+    console.error('insertWaterLog error:', error);
+    return { error };
+  }
+};
+
+/** היסטוריית משקל — למגמות ב-AI */
+export const getWeightLogsSince = async (userId, startDate) => {
+  try {
+    const { data, error } = await supabase
+      .from('weight_logs')
+      .select('id, weight_kg, day_date, logged_at, source')
+      .eq('user_id', userId)
+      .gte('day_date', startDate)
+      .order('logged_at', { ascending: false });
+
+    if (error) throw error;
+    return { data: data || [], error: null };
+  } catch (error) {
+    console.error('Get weight logs error:', error);
+    return { data: [], error };
+  }
+};
+
+export const insertWeightLog = async (userId, dayDate, weightKg, source = 'profile') => {
+  try {
+    const { error } = await supabase.from('weight_logs').insert({
+      user_id: userId,
+      day_date: dayDate,
+      weight_kg: weightKg,
+      logged_at: new Date().toISOString(),
+      source,
+    });
+    if (error) throw error;
+    return { error: null };
+  } catch (error) {
+    console.error('insertWeightLog error:', error);
+    return { error };
+  }
+};
+
 // ============ Meals Functions ============
 
 // שמירת ארוחה
 export const saveMeal = async (userId, mealData) => {
   try {
-    console.log('[Supabase] saveMeal: userId:', userId, 'data:', mealData);
+    if (__DEV__) console.log('[Supabase] saveMeal: userId:', userId, 'data:', mealData);
     const { data, error } = await supabase
       .from('meals')
       .insert({
@@ -397,7 +528,7 @@ export const saveMeal = async (userId, mealData) => {
       console.error('[Supabase] saveMeal error:', error);
       throw error;
     }
-    console.log('[Supabase] saveMeal success:', data?.id, data?.name);
+    if (__DEV__) console.log('[Supabase] saveMeal success:', data?.id, data?.name);
     return { data, error: null };
   } catch (error) {
     console.error('[Supabase] saveMeal catch error:', error);

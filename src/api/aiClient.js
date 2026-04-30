@@ -1,41 +1,27 @@
 // ============================================================
-// OpenAI Client for BioBalance - Clean Architecture
+// LLM client for BioBalance — all calls go through Gemini
+// (Supabase Edge Function gemini-proxy; key stays on server).
 // ============================================================
 
-export const OPENAI_API_KEY = process.env.EXPO_PUBLIC_OPENAI_API_KEY || '';
-export const OPENAI_API_URL = 'https://api.openai.com/v1/chat/completions';
+import { callGemini, GEMINI_MODEL, RateLimitError } from './geminiClient';
 
-// ============================================================
-// Core API Call
-// ============================================================
+/** Gemini (via Edge or direct); name is historical — not OpenAI. */
+const callLlm = async (messages, options = {}) => {
+  const maxTokens =
+    options.max_completion_tokens ?? options.max_tokens ?? options.maxTokens ?? 500;
+  const responseMimeType =
+    options.responseMimeType ||
+    (options.response_format?.type === 'json_object' ? 'application/json' : undefined);
 
-const callOpenAI = async (messages, options = {}) => {
-  try {
-    const response = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: options.model || 'gpt-4o-mini',
-        messages,
-        temperature: options.temperature ?? 0.3,
-        max_completion_tokens: options.max_completion_tokens || 500,
-      }),
-    });
-
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error?.message || 'OpenAI API error');
-    }
-
-    const data = await response.json();
-    return data.choices[0].message.content;
-  } catch (error) {
-    console.error('OpenAI Error:', error);
-    throw error;
-  }
+  return await callGemini(messages, {
+    model: options.model,
+    temperature: options.temperature ?? 0.3,
+    maxTokens,
+    responseMimeType,
+    signal: options.signal,
+    timeoutMs: options.timeoutMs,
+    thinkingBudget: options.thinkingBudget,
+  });
 };
 
 // ============================================================
@@ -134,7 +120,7 @@ export const parseFoodFromText = async (text) => {
 "בננה" → {"found": true, "ready": [{"name": "בננה", "grams": 120, "calories": 105, "protein": 1.3, "fat": 0.4}], "needQuantity": []}`;
 
   try {
-    const response = await callOpenAI([
+    const response = await callLlm([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: text }
     ], { temperature: 0.1, max_completion_tokens: 400 });
@@ -188,7 +174,7 @@ export const parseFoodFromText = async (text) => {
 
 export const chatWithBot = async (userMessage, context, conversationHistory = []) => {
   const isRecipeRequest = /מתכון|איך מכינים|איך להכין/.test(userMessage);
-  const isMealPlanRequest = /סדר יום|תוכנית|תכנון|מה לאכול|רעיון לארוחה|תפריט|לוח זמנים|שעה|ארוחות/.test(userMessage);
+  const isMealPlanRequest = /סדר יום|תוכנית|תכנון|מה לאכול|תפריט מתוכנן|רעיון לארוחה|תפריט|לוח זמנים|שעה|ארוחות/.test(userMessage);
 
   let systemPrompt;
   let maxTokens = 250;
@@ -209,7 +195,7 @@ export const chatWithBot = async (userMessage, context, conversationHistory = []
     { role: 'user', content: userMessage }
   ];
 
-  return await callOpenAI(messages, {
+  return await callLlm(messages, {
     temperature: 0.7,
     max_completion_tokens: maxTokens
   });
@@ -523,30 +509,21 @@ ${goal === 'bulk' ? '- מסה: משהו קטן ודחוס - חמאת בוטני�
 
 export const estimate3DWeight = async (imagesBase64) => {
   try {
-    // Build image content array
-    const imageContents = imagesBase64.map((img, index) => ({
+    const imageContents = imagesBase64.map((img) => ({
       type: 'image_url',
       image_url: {
         url: `data:image/jpeg;base64,${img}`,
-        detail: 'low'
-      }
+      },
     }));
 
-    const response = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `אתה מומחה להערכת משקל מזון. יש לך 3 תמונות של אותה מנה:
+    const content = await callLlm(
+      [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: `אתה מומחה להערכת משקל מזון. יש לך 3 תמונות של אותה מנה:
 - תמונה 1: מבט מלמעלה
 - תמונה 2: מבט מהצד  
 - תמונה 3: תקריב
@@ -561,26 +538,18 @@ export const estimate3DWeight = async (imagesBase64) => {
     {"name": "שם נוסף", "grams": 100, "calories": 150, "protein": 5, "fat": 3}
   ],
   "confidence": "medium"
-}`
-              },
-              ...imageContents
-            ]
-          }
-        ],
-        max_tokens: 2000,
+}`,
+            },
+            ...imageContents,
+          ],
+        },
+      ],
+      {
         temperature: 0.1,
-        response_format: { type: "json_object" },
-      }),
-    });
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      console.error('3D Weight API error:', response.status, errorData);
-      throw new Error(`API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content || '';
+        max_completion_tokens: 2000,
+        response_format: { type: 'json_object' },
+      },
+    );
 
     console.log('3D API Response:', content);
 
@@ -673,42 +642,22 @@ export const analyzeFoodFromImage = async (imageBase64, totalGrams = null) => {
       ? `זו ארוחה במשקל ${totalGrams} גרם. זהה את המרכיבים וחשב כמה גרם מתוך ה-${totalGrams}g שייך לכל אחד.`
       : 'מה יש בתמונה? השתדל להפריד בין המרכיבים העיקריים (חלבון, פחמימה, ירק). תן הערכה לכל אחד.';
 
-    const response = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o',
-        messages: [
-          {
-            role: 'system',
-            content: systemContent
-          },
-          {
-            role: 'user',
-            content: [
-              { type: 'text', text: userPrompt },
-              {
-                type: 'image_url',
-                image_url: {
-                  url: `data:image/jpeg;base64,${imageBase64}`,
-                  detail: 'low'
-                }
-              }
-            ]
-          }
-        ],
-        max_completion_tokens: 400,
-        temperature: 0.2,
-      }),
-    });
-
-    if (!response.ok) throw new Error('Vision API error');
-
-    const data = await response.json();
-    const content = data.choices[0].message.content;
+    const content = await callLlm(
+      [
+        { role: 'system', content: systemContent },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: userPrompt },
+            {
+              type: 'image_url',
+              image_url: { url: `data:image/jpeg;base64,${imageBase64}` },
+            },
+          ],
+        },
+      ],
+      { max_completion_tokens: 400, temperature: 0.2 },
+    );
 
     // Helper to clean JSON
     const cleanContent = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
@@ -717,7 +666,7 @@ export const analyzeFoodFromImage = async (imageBase64, totalGrams = null) => {
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
 
-      console.log('🔍 GPT Vision Response:', JSON.stringify(parsed, null, 2));
+      console.log('🔍 Vision model response:', JSON.stringify(parsed, null, 2));
       console.log('🔍 Number of items:', parsed.items?.length || 1);
       console.log('🔍 Total grams provided:', totalGrams);
 
@@ -766,7 +715,8 @@ export const analyzeFoodFromImage = async (imageBase64, totalGrams = null) => {
 // ============================================================
 
 export const calculateNutritionTargets = async (userData) => {
-  const genderHeb = userData.gender === 'male' ? 'גבר' : 'אישה';
+  const genderHeb =
+    userData.gender === 'male' ? 'גבר' : userData.gender === 'female' ? 'אישה' : 'לא צוין (השתמש בהנחיות יוניסקס / ממוצע)';
 
   const activityMap = {
     sedentary: 'יושבני',
@@ -774,13 +724,30 @@ export const calculateNutritionTargets = async (userData) => {
     moderate: 'פעילות בינונית',
     active: 'פעילות גבוהה',
     intense: 'פעילות אינטנסיבית',
+    high: 'פעילות גבוהה',
   };
 
   const goalMap = {
     cut: 'ירידה במשקל',
     maintain: 'שמירה',
+    lean_bulk: 'עלייה מתונה במסה (lean bulk)',
     bulk: 'עלייה במסה',
   };
+
+  const paceMap = {
+    slow: 'קצב רגוע – יציבות לטווח ארוך',
+    balanced: 'איזון בין תוצאות לנוחות',
+    fast: 'שינוי מהיר בגבולות הבריא',
+  };
+  const paceLine =
+    userData.pace && paceMap[userData.pace] ? `\nקצב רצוי: ${paceMap[userData.pace]}` : '';
+
+  const actKey = userData.activity_level === 'high' ? 'active' : userData.activity_level;
+  const presetActivityLabel = activityMap[actKey] || activityMap.moderate;
+  const customAct = (userData.activity_level_notes || '').trim();
+  const activityBlock = customAct
+    ? customAct
+    : presetActivityLabel;
 
   const systemPrompt = `אתה דיאטן קליני. חשב יעדים תזונתיים.
 
@@ -822,11 +789,11 @@ BMI = משקל / גובה²
 גיל: ${userData.age}
 גובה: ${userData.height_cm} ס"מ
 משקל: ${userData.weight_kg} ק"ג
-פעילות: ${activityMap[userData.activity_level]}
-מטרה: ${goalMap[userData.goal]}`;
+פעילות: ${activityBlock}
+מטרה: ${goalMap[userData.goal] || goalMap.maintain}${paceLine}`;
 
   try {
-    const response = await callOpenAI([
+    const response = await callLlm([
       { role: 'system', content: systemPrompt },
       { role: 'user', content: userPrompt }
     ], { temperature: 0.1, max_completion_tokens: 400 });
@@ -837,23 +804,43 @@ BMI = משקל / גובה²
     }
     throw new Error('No JSON');
   } catch (error) {
-    console.error('Calculation error:', error);
+    if (error instanceof RateLimitError || error?.name === 'RateLimitError') {
+      console.warn(
+        '[calculateNutritionTargets] Daily AI quota reached; using local formula.',
+        error.message,
+      );
+    } else {
+      console.error(
+        '[calculateNutritionTargets] LLM error (Gemini/Edge):',
+        error?.message || error,
+      );
+    }
     return calculateLocalTargets(userData);
   }
 };
 
 // Local fallback calculation
 const calculateLocalTargets = (userData) => {
-  let bmr = userData.gender === 'male'
-    ? 10 * userData.weight_kg + 6.25 * userData.height_cm - 5 * userData.age + 5
-    : 10 * userData.weight_kg + 6.25 * userData.height_cm - 5 * userData.age - 161;
+  const bmrMale = 10 * userData.weight_kg + 6.25 * userData.height_cm - 5 * userData.age + 5;
+  const bmrFemale = 10 * userData.weight_kg + 6.25 * userData.height_cm - 5 * userData.age - 161;
+  let bmr =
+    userData.gender === 'male' ? bmrMale : userData.gender === 'female' ? bmrFemale : (bmrMale + bmrFemale) / 2;
 
-  const multipliers = { sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, intense: 1.9 };
-  const tdee = Math.round(bmr * (multipliers[userData.activity_level] || 1.2));
+  const multipliers = { sedentary: 1.2, light: 1.375, moderate: 1.55, active: 1.725, intense: 1.9, high: 1.725 };
+  const act = userData.activity_level === 'high' ? 'active' : userData.activity_level;
+  const tdee = Math.round(bmr * (multipliers[act] || 1.2));
 
   let calories = tdee;
-  if (userData.goal === 'cut') calories = tdee - 400;
-  else if (userData.goal === 'bulk') calories = tdee + 300;
+  const pace = userData.pace || 'balanced';
+  const paceCut = pace === 'slow' ? -350 : pace === 'fast' ? -500 : -400;
+  const paceBulk = pace === 'slow' ? 250 : pace === 'fast' ? 400 : 300;
+  const paceLean = pace === 'slow' ? 150 : pace === 'fast' ? 250 : 200;
+
+  if (userData.goal === 'cut') calories = tdee + paceCut;
+  else if (userData.goal === 'bulk') calories = tdee + paceBulk;
+  else if (userData.goal === 'lean_bulk') calories = tdee + paceLean;
+
+  calories = Math.round(calories);
 
   const protein = Math.round(userData.weight_kg * 1.8);
   const fat = Math.round((calories * 0.25) / 9);
@@ -867,9 +854,11 @@ const calculateLocalTargets = (userData) => {
   else if (bmi >= 25 && bmi < 30) bmiCategory = 'עודף משקל';
   else if (bmi >= 30) bmiCategory = 'השמנה';
 
+  const waterGlasses = userData.goal === 'bulk' || userData.goal === 'lean_bulk' ? 10 : 8;
+
   return {
     calories, protein, fat, carbs,
-    water: userData.goal === 'bulk' ? 10 : 8,
+    water: waterGlasses,
     bmr: Math.round(bmr), tdee, bmi, bmi_category: bmiCategory,
     explanation: 'יעדים מחושבים לפי הנתונים שלך'
   };
@@ -891,37 +880,69 @@ export const getDailySummary = async (context) => {
 השתמש ב-1-2 אימוג'ים. היה מקצועי ונעים.
 אם קלוריות גבוהות ושומן נמוך - הצע שומן בריא.`;
 
-  return await callOpenAI([
+  return await callLlm([
     { role: 'system', content: prompt },
     { role: 'user', content: 'סכם' }
   ], { max_completion_tokens: 150 });
 };
 
+export const getNutritionAdvice = async (context, question) => {
+  const ctx =
+    context && typeof context === 'object' ? JSON.stringify(context, null, 0) : String(context ?? '');
+  return await callLlm(
+    [
+      {
+        role: 'system',
+        content:
+          'אתה יועץ תזונה. ענה בעברית, בקצרה ובצורה מעשית. בלי אבחנה רפואית; המלץ לפגוש איש מקצוע כשצריך.',
+      },
+      { role: 'user', content: `הקשר:\n${ctx}\n\nשאלה:\n${question}` },
+    ],
+    { max_completion_tokens: 400, temperature: 0.5 },
+  );
+};
+
 // ============================================================
-// Advanced AI Analysis with o1 Model
+// Advanced nutrition analysis (Gemini via proxy)
 // ============================================================
 
-export const analyzeNutritionWithO1 = async (dailyStats, targets, profile) => {
+export const analyzeNutritionWithO1 = async (dailyStats, targets, profile, options = {}) => {
+  const { behaviorNarrative = '' } = options;
+  const carbTarget = targets?.carbs || profile?.carbs_target || 250;
   const caloriesPct = Math.round(((dailyStats?.calories || 0) / (targets?.calories || 2000)) * 100);
   const proteinPct = Math.round(((dailyStats?.protein || 0) / (targets?.protein || 90)) * 100);
   const fatPct = Math.round(((dailyStats?.fat || 0) / (targets?.fat || 65)) * 100);
   const waterPct = Math.round(((dailyStats?.water_glasses || 0) / (targets?.water || 8)) * 100);
-  const overallScore = Math.round((Math.min(100, caloriesPct) + Math.min(100, proteinPct) + Math.min(100, fatPct) + Math.min(100, waterPct)) / 4);
+  const carbPct = Math.round(((dailyStats?.carbs || 0) / (carbTarget || 1)) * 100);
+  const overallScore = Math.round(
+    (Math.min(100, caloriesPct) +
+      Math.min(100, proteinPct) +
+      Math.min(100, fatPct) +
+      Math.min(100, waterPct) +
+      Math.min(100, carbPct)) /
+      5
+  );
 
   const hour = new Date().getHours();
   const timeOfDay = hour < 12 ? 'בוקר' : hour < 17 ? 'צהריים' : hour < 21 ? 'ערב' : 'לילה';
+
+  const historyBlock =
+    behaviorNarrative && String(behaviorNarrative).trim().length > 0
+      ? `\n📆 הקשר מהמסד (היסטוריה אמיתית, ~שלושה שבועות — דפוסי שעות, מקורות דיווח, פחמימות יומיות, מים, מגמת משקל):\n${behaviorNarrative.trim()}\n`
+      : '\n(אין עדיין מספיק היסטוריה מעמיקה במסד — הטמע דפוסים ככל שהנתונים למעלה מאפשרים.)\n';
 
   const prompt = `אתה דיאטן קליני מקצועי. נתח את הנתונים התזונתיים הבאים ותן דוח מפורט ומותאם אישית.
 
 📊 נתוני המשתמש:
 - שם: ${profile?.name || 'משתמש'}
 - מטרה: ${profile?.goal === 'cut' ? 'ירידה במשקל' : profile?.goal === 'bulk' ? 'עלייה במסה' : 'שמירה'}
-- רמת פעילות: ${profile?.activity_level || 'בינונית'}
-
+- רמת פעילות: ${(profile?.activity_level_notes || '').trim() || profile?.activity_level || 'בינונית'}
+${historyBlock}
 📈 סטטוס יומי (${timeOfDay}):
 - קלוריות: ${dailyStats?.calories || 0}/${targets?.calories || 2000} (${caloriesPct}%)
 - חלבון: ${Math.round(dailyStats?.protein || 0)}g/${targets?.protein || 90}g (${proteinPct}%)
 - שומן: ${Math.round(dailyStats?.fat || 0)}g/${targets?.fat || 65}g (${fatPct}%)
+- פחמימות: ${Math.round(dailyStats?.carbs || 0)}g/${carbTarget}g (${carbPct}%)
 - מים: ${dailyStats?.water_glasses || 0}/${targets?.water || 8} כוסות (${waterPct}%)
 - ציון כללי: ${overallScore}%
 
@@ -941,121 +962,61 @@ export const analyzeNutritionWithO1 = async (dailyStats, targets, profile) => {
 חשוב:
 1. התאם את ההמלצות לשעה ביום (${timeOfDay}) - אם ערב, אל תציע ארוחות כבדות
 2. התאם למטרה של המשתמש (${profile?.goal === 'cut' ? 'ירידה במשקל' : profile?.goal === 'bulk' ? 'עלייה במסה' : 'שמירה'})
-3. היה ספציפי עם כמויות ומזונות
-4. אם יש חוסר משמעותי, תן פתרון מיידי ופרקטי
-5. השתמש באימוג'ים רלוונטיים`;
+3. אם הופיעה היסטוריה מהמסד — שילב בניתוח: באיזו שעות בדרך כלל אוכל/מדווח, מה חוזר, איפה בדרך כלל "נופל" (למשל חלבון מאוחר, מעט מים בבוקר)
+4. היה ספציפי עם כמויות ומזונות
+5. אם יש חוסר משמעותי, תן פתרון מיידי ופרקטי
+6. השתמש באימוג'ים רלוונטיים (במידה)`;
 
   try {
-    const response = await fetch(OPENAI_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: 'o1',  // Using o1 for advanced reasoning
-        messages: [
-          {
-            role: 'user',
-            content: `אתה דיאטן קליני מקצועי. תענה תמיד בפורמט JSON בלבד.\n\n${prompt}`
-          }
-        ],
+    const content = await callLlm(
+      [
+        {
+          role: 'system',
+          content: 'אתה דיאטן קליני מקצועי. תענה תמיד בפורמט JSON בלבד, ללא טקסט מחוץ ל-JSON.',
+        },
+        { role: 'user', content: prompt },
+      ],
+      {
+        temperature: 0.3,
         max_completion_tokens: 2000,
-        // Note: o1 doesn't support temperature or system messages
-      }),
-    });
+        response_format: { type: 'json_object' },
+      },
+    );
 
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      console.error('o1 API Error:', response.status, errorData);
-      // Try gpt-4o as fallback
-      return await analyzeWithGPT4o(dailyStats, targets, profile, prompt);
-    }
-
-    const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
-
-    if (!content) {
-      throw new Error('No content in response');
-    }
-
-    // Parse JSON from response
     const jsonMatch = content.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       return {
         success: true,
         ...parsed,
-        model: 'o1',
+        model: GEMINI_MODEL,
         timestamp: new Date().toISOString(),
       };
     }
 
     throw new Error('No valid JSON in response');
   } catch (error) {
-    console.error('o1 Analysis error:', error.message || error);
-    // Try gpt-4o as fallback
-    try {
-      return await analyzeWithGPT4o(dailyStats, targets, profile, prompt);
-    } catch (fallbackError) {
-      return await analyzeNutritionFallback(dailyStats, targets, profile);
-    }
+    console.error('Nutrition analysis error:', error.message || error);
+    return await analyzeNutritionFallback(dailyStats, targets, profile);
   }
 };
 
-// Fallback to GPT-4o if o1 fails
-const analyzeWithGPT4o = async (dailyStats, targets, profile, prompt) => {
-  console.log('Falling back to gpt-4o...');
-
-  const response = await fetch(OPENAI_API_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: 'אתה דיאטן קליני מקצועי. תענה תמיד בפורמט JSON בלבד.' },
-        { role: 'user', content: prompt }
-      ],
-      max_tokens: 1500,
-      temperature: 0.3,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error('GPT-4o fallback also failed');
-  }
-
-  const data = await response.json();
-  const content = data.choices?.[0]?.message?.content;
-
-  if (!content) {
-    throw new Error('No content in gpt-4o response');
-  }
-
-  const jsonMatch = content.match(/\{[\s\S]*\}/);
-  if (jsonMatch) {
-    const parsed = JSON.parse(jsonMatch[0]);
-    return {
-      success: true,
-      ...parsed,
-      model: 'gpt-4o',
-      timestamp: new Date().toISOString(),
-    };
-  }
-
-  throw new Error('No valid JSON in gpt-4o response');
-};
-
-// Fallback function using regular GPT model
+// Fallback function (local heuristics)
 const analyzeNutritionFallback = async (dailyStats, targets, profile) => {
+  const carbTarget = targets?.carbs || profile?.carbs_target || 250;
   const caloriesPct = Math.round(((dailyStats?.calories || 0) / (targets?.calories || 2000)) * 100);
   const proteinPct = Math.round(((dailyStats?.protein || 0) / (targets?.protein || 90)) * 100);
   const fatPct = Math.round(((dailyStats?.fat || 0) / (targets?.fat || 65)) * 100);
   const waterPct = Math.round(((dailyStats?.water_glasses || 0) / (targets?.water || 8)) * 100);
-  const overallScore = Math.round((Math.min(100, caloriesPct) + Math.min(100, proteinPct) + Math.min(100, fatPct) + Math.min(100, waterPct)) / 4);
+  const carbPct = Math.round(((dailyStats?.carbs || 0) / (carbTarget || 1)) * 100);
+  const overallScore = Math.round(
+    (Math.min(100, caloriesPct) +
+      Math.min(100, proteinPct) +
+      Math.min(100, fatPct) +
+      Math.min(100, waterPct) +
+      Math.min(100, carbPct)) /
+      5
+  );
 
   // Generate insights locally
   const strengths = [];
@@ -1066,21 +1027,29 @@ const analyzeNutritionFallback = async (dailyStats, targets, profile) => {
   if (fatPct >= 80) strengths.push('🥑 שומן בריא במקום - תומך בבריאות הלב');
   if (waterPct >= 80) strengths.push('💧 שתיית מים מצוינת - הגוף מרוצה!');
   if (caloriesPct >= 80 && caloriesPct <= 110) strengths.push('🎯 איזון קלורי מושלם');
+  if (carbPct >= 80 && carbPct <= 120) strengths.push('🌾 איזון פחמימות טוב ליעד');
 
   if (proteinPct < 60) {
-    const missing = Math.round(targets.protein - (dailyStats?.protein || 0));
+    const missing = Math.round((targets?.protein || 90) - (dailyStats?.protein || 0));
     improvements.push(`חסרים ${missing}g חלבון - הוסף ביצים, חזה עוף או יוגורט`);
     actionItems.push(`🥚 הוסף מקור חלבון בארוחה הבאה (${missing}g חסרים)`);
   }
   if (fatPct < 50) {
-    const missing = Math.round(targets.fat - (dailyStats?.fat || 0));
+    const missing = Math.round((targets?.fat || 65) - (dailyStats?.fat || 0));
     improvements.push(`חסרים ${missing}g שומן - אבוקדו, אגוזים או שמן זית`);
     actionItems.push(`🥑 חופן אגוזים או חצי אבוקדו יעזרו`);
   }
   if (waterPct < 60) {
-    const missing = targets.water - (dailyStats?.water_glasses || 0);
+    const missing = (targets?.water || 8) - (dailyStats?.water_glasses || 0);
     improvements.push(`חסרות ${missing} כוסות מים`);
     actionItems.push(`💧 שתה כוס מים עכשיו!`);
+  }
+  if (carbPct < 55) {
+    const missingG = Math.round(carbTarget - (dailyStats?.carbs || 0));
+    improvements.push(`פחמימות נמוכות מול היעד — אפשר להוסיף אורז/שיבולים/לחם מלא (חסר בערך ${missingG}g)`);
+  }
+  if (carbPct > 130) {
+    improvements.push('פחמימות מעל היעד — שקלו/י להחליף לירקות או מקור חלבון');
   }
 
   if (strengths.length === 0) {
