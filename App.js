@@ -1,22 +1,23 @@
 /**
  * App.js - BioBalance
- * 
+ *
  * CLEAN AUTHENTICATION ARCHITECTURE
  * ================================
  * Single source of truth: Supabase auth.onAuthStateChange
- * 
+ *
  * States:
  * - authState = 'initializing' → Loading screen
  * - authState = 'unauthenticated' → Login screen
  * - authState = 'authenticated' → Main app
  */
 
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { AppProvider } from './src/context/AppContext';
 import { StatusBar } from 'expo-status-bar';
 import { View, StyleSheet, Image, Text, AppState } from 'react-native';
+import * as Notifications from 'expo-notifications';
 import useNotifications from './src/hooks/useNotifications';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { supabase } from './src/api/supabaseClient';
@@ -32,9 +33,6 @@ import Animated, {
 } from 'react-native-reanimated';
 
 // Silence the noisy "Reading from `value` during component render" warning.
-// It fires from `useAnimatedStyle`'s initial JS-thread pass on every render,
-// which is expected behavior - not something we can (or should) refactor per
-// call site. We still surface real errors.
 configureReanimatedLogger({
   level: ReanimatedLogLevel.warn,
   strict: false,
@@ -52,6 +50,7 @@ import RecipeDetail from './src/screens/RecipeDetail';
 import Reminders from './src/screens/Reminders';
 import NotificationSettings from './src/screens/NotificationSettings';
 import AIInsights from './src/screens/AIInsights';
+import Insights from './src/screens/Insights';
 import Profile from './src/screens/Profile';
 import Account from './src/screens/Account';
 import RecentMeals from './src/screens/RecentMeals';
@@ -114,14 +113,16 @@ const AuthStack = () => (
 // ============================================================
 const MainStack = ({ hasCompletedOnboarding }) => {
   const initialRoute = hasCompletedOnboarding ? 'Home' : 'Onboarding';
-  
+
   return (
-    <Stack.Navigator 
+    <Stack.Navigator
       initialRouteName={initialRoute}
       screenOptions={{ headerShown: false, animation: 'slide_from_left' }}
     >
       <Stack.Screen name="Onboarding" component={Onboarding} />
       <Stack.Screen name="Home" component={Home} />
+      <Stack.Screen name="Insights" component={Insights} />
+      {/* Statistics & AIInsights kept for legacy / deep links. */}
       <Stack.Screen name="Statistics" component={Statistics} />
       <Stack.Screen name="Recipes" component={Recipes} />
       <Stack.Screen name="RecipeDetail" component={RecipeDetail} />
@@ -142,14 +143,12 @@ const MainStack = ({ hasCompletedOnboarding }) => {
 // MAIN APP
 // ============================================================
 export default function App() {
-  // Auth states: 'initializing' | 'unauthenticated' | 'authenticated'
   const [authState, setAuthState] = useState('initializing');
   const [session, setSession] = useState(null);
   const initRef = useRef(false);
-  const authResolvedRef = useRef(false); // Track if auth has been resolved
+  const authResolvedRef = useRef(false);
 
   useEffect(() => {
-    // Prevent double initialization in dev mode
     if (initRef.current) return;
     initRef.current = true;
 
@@ -157,52 +156,36 @@ export default function App() {
       console.log('[App] Initializing...');
     }
 
-    // ================================================
-    // SINGLE SOURCE OF TRUTH: Supabase auth listener
-    // ================================================
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
       if (__DEV__ && event !== 'TOKEN_REFRESHED') {
         console.log('[App] Auth event:', event, newSession?.user?.email || 'no user');
       }
-
-      // Mark auth as resolved on ANY event
       authResolvedRef.current = true;
 
       switch (event) {
         case 'INITIAL_SESSION':
-          // First check on app load
           if (newSession) {
-            if (__DEV__) console.log('[App] Initial session found');
             setSession(newSession);
             setAuthState('authenticated');
           } else {
-            if (__DEV__) console.log('[App] No initial session');
             setAuthState('unauthenticated');
           }
           break;
-
         case 'SIGNED_IN':
-          if (__DEV__) console.log('[App] User signed in');
           setSession(newSession);
           setAuthState('authenticated');
           break;
-
         case 'TOKEN_REFRESHED':
-          // Silent session rotation — avoid log spam
           if (newSession) {
             setSession(newSession);
             setAuthState('authenticated');
           }
           break;
-
         case 'SIGNED_OUT':
-          if (__DEV__) console.log('[App] User signed out');
           setSession(null);
           setAuthState('unauthenticated');
           break;
-
         default:
-          // For any other event, just update session if present
           if (newSession) {
             setSession(newSession);
             setAuthState('authenticated');
@@ -210,12 +193,8 @@ export default function App() {
       }
     });
 
-    // Timeout fallback - ONLY if no auth event has fired yet
     const timeout = setTimeout(() => {
       if (!authResolvedRef.current) {
-        if (__DEV__) {
-          console.log('[App] Timeout - no auth event received, forcing unauthenticated');
-        }
         setAuthState('unauthenticated');
       }
     }, 5000);
@@ -226,11 +205,6 @@ export default function App() {
     };
   }, []);
 
-  // ================================================
-  // RENDER BASED ON AUTH STATE
-  // ================================================
-  
-  // Still initializing
   if (authState === 'initializing') {
     return (
       <SafeAreaProvider>
@@ -239,7 +213,6 @@ export default function App() {
     );
   }
 
-  // Not logged in
   if (authState === 'unauthenticated' || !session) {
     return (
       <SafeAreaProvider>
@@ -251,25 +224,40 @@ export default function App() {
     );
   }
 
-  // Logged in - wrap with AppProvider
   return (
     <SafeAreaProvider>
       <AppProvider session={session}>
-        <NavigationContainer>
-          <StatusBar style="dark" />
-          <AppNavigator />
-        </NavigationContainer>
+        <AppRootWithNav />
       </AppProvider>
     </SafeAreaProvider>
   );
 }
 
 // ============================================================
+// APP ROOT - holds the navigation container ref for deep-linking
+// from notification taps (weekly check-in → Insights screen).
+// ============================================================
+const AppRootWithNav = () => {
+  const navigationRef = useRef(null);
+  return (
+    <NavigationContainer ref={navigationRef}>
+      <StatusBar style="dark" />
+      <AppNavigator navigationRef={navigationRef} />
+    </NavigationContainer>
+  );
+};
+
+// ============================================================
 // APP NAVIGATOR - Inside AppProvider, has access to context
 // ============================================================
-const AppNavigator = () => {
+const AppNavigator = ({ navigationRef }) => {
   const { isLoading, hasCompletedOnboarding } = require('./src/context/AppContext').useApp();
-  const { checkAndSendSmartNotification, scheduleInactivityCheck } = useNotifications();
+  const {
+    checkAndSendSmartNotification,
+    scheduleInactivityCheck,
+    scheduleWeeklyCheckin,
+    markWeeklyCheckinShown,
+  } = useNotifications();
   const navLogRef = useRef(null);
 
   useEffect(() => {
@@ -290,19 +278,34 @@ const AppNavigator = () => {
     navLogRef.current = { isLoading, hasCompletedOnboarding };
   }, [isLoading, hasCompletedOnboarding]);
 
-  // Re-arm the 3.5h inactivity nudge whenever the app comes to the
-  // foreground, and run a "should we ping the user now?" check. This
-  // catches users who reopened the app late and shouldn't get an
-  // immediate push.
   useEffect(() => {
-    // Run once on mount.
     scheduleInactivityCheck();
     checkAndSendSmartNotification();
+    scheduleWeeklyCheckin();
 
     const sub = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'active') {
         checkAndSendSmartNotification();
         scheduleInactivityCheck();
+        scheduleWeeklyCheckin();
+      }
+    });
+    return () => {
+      sub.remove();
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Weekly check-in notification → deep-link into Insights screen + modal.
+  useEffect(() => {
+    const sub = Notifications.addNotificationResponseReceivedListener(async (response) => {
+      const data = response?.notification?.request?.content?.data;
+      if (!data) return;
+      if (data.type === 'weekly_checkin') {
+        await markWeeklyCheckinShown();
+        try {
+          navigationRef?.current?.navigate('Insights', { tab: 'ai', openCheckin: true });
+        } catch (_) {}
       }
     });
     return () => {

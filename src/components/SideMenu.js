@@ -34,12 +34,14 @@ const SPRING_CONFIG = {
   restSpeedThreshold: 0.01,
 };
 
+// "תובנות" is the unified Stats + AI entry. The old Statistics &
+// AIInsights screens are still reachable via deep links but no longer
+// surfaced separately in the menu.
 const menuItems = [
   { id: 'home', label: 'דף בית', icon: '🏠', screen: 'Home' },
+  { id: 'insights', label: 'תובנות', icon: '✨', screen: 'Insights' },
   { id: 'birkat-hamazon', label: 'ברכת המזון', icon: '📿', screen: 'BirkatHamazon' },
-  { id: 'ai-insights', label: 'AI ניתוח', icon: '🧠', screen: 'AIInsights' },
   { id: 'reminders', label: 'תזכורות ארוחות', icon: '🔔', screen: 'NotificationSettings' },
-  { id: 'statistics', label: 'סטטיסטיקות', icon: '📊', screen: 'Statistics' },
   { id: 'recipes', label: 'מתכונים', icon: '📖', screen: 'Recipes' },
   { id: 'settings', label: 'הגדרות', icon: '⚙️', screen: 'Profile' },
   { id: 'sources', label: 'אודות ומקורות', icon: '📚', screen: 'Sources' },
@@ -54,7 +56,7 @@ const MenuItem = memo(({ label, icon, onPress, index, progress }) => {
       [0, 1],
       Extrapolate.CLAMP
     );
-    
+
     return {
       opacity: itemProgress,
       transform: [
@@ -66,9 +68,9 @@ const MenuItem = memo(({ label, icon, onPress, index, progress }) => {
 
   return (
     <Animated.View style={itemStyle}>
-      <TouchableOpacity 
-        style={styles.menuItem} 
-        onPress={onPress} 
+      <TouchableOpacity
+        style={styles.menuItem}
+        onPress={onPress}
         activeOpacity={0.7}
       >
         <View style={styles.menuItemContent}>
@@ -87,9 +89,9 @@ function SideMenu({ isOpen, onClose, onNavigate, profile }) {
   useEffect(() => {
     if (isOpen) {
       slideProgress.value = withSpring(1, SPRING_CONFIG);
-      itemsProgress.value = withTiming(1, { 
-        duration: 500, 
-        easing: Easing.bezier(0.25, 0.1, 0.25, 1) 
+      itemsProgress.value = withTiming(1, {
+        duration: 500,
+        easing: Easing.bezier(0.25, 0.1, 0.25, 1)
       });
     } else {
       itemsProgress.value = withTiming(0, { duration: 150 });
@@ -126,28 +128,20 @@ function SideMenu({ isOpen, onClose, onNavigate, profile }) {
 
   return (
     <View style={styles.container} pointerEvents={isOpen ? 'auto' : 'none'}>
-      {/* Backdrop with blur effect */}
       <Animated.View style={[styles.backdrop, backdropStyle]}>
         <Pressable style={styles.backdropTouch} onPress={onClose} />
       </Animated.View>
 
-      {/* Menu Panel */}
       <Animated.View style={[styles.menuPanel, menuStyle]}>
-        {/* Header - Clean White */}
         <View style={styles.menuHeader}>
-          {/* Header Content */}
           <Animated.View style={[styles.headerContent, headerStyle]}>
-            {/* User Info Card */}
             {profile?.name && (
               <View style={styles.userInfo}>
-                {/* User name on LEFT */}
                 <View style={styles.userTextContainer}>
                   <Text style={styles.userName}>{profile.name}</Text>
                   <Text style={styles.userStatus}>מחובר</Text>
                 </View>
-                {/* Online indicator */}
                 <View style={styles.onlineIndicator} />
-                {/* Avatar on RIGHT */}
                 <View style={styles.avatarCircle}>
                   <Text style={styles.avatarText}>{profile.name.charAt(0).toUpperCase()}</Text>
                 </View>
@@ -156,10 +150,8 @@ function SideMenu({ isOpen, onClose, onNavigate, profile }) {
           </Animated.View>
         </View>
 
-        {/* Decorative line */}
         <View style={styles.decorLine} />
 
-        {/* Menu Items */}
         <View style={styles.menuItems}>
           {menuItems.map((item, index) => (
             <MenuItem
@@ -173,7 +165,6 @@ function SideMenu({ isOpen, onClose, onNavigate, profile }) {
           ))}
         </View>
 
-        {/* Footer with Logo */}
         <View style={styles.menuFooter}>
           <View style={styles.footerDivider} />
           <Image source={LOGO_IMAGE} style={styles.footerLogoImage} resizeMode="contain" />

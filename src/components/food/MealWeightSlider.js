@@ -21,6 +21,8 @@ import { LinearGradient } from 'expo-linear-gradient';
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const SLIDER_HEIGHT = 280; // Match keyboard height
 
+const GRAM_SLIDER_MAX = 400;
+
 const MealWeightSlider = ({
     visible,
     onClose,
@@ -36,7 +38,7 @@ const MealWeightSlider = ({
     useEffect(() => {
         if (visible) {
             // Reset to default
-            setGrams(250);
+            setGrams(Math.min(250, GRAM_SLIDER_MAX));
             // Animate in
             translateY.value = withSpring(0, {
                 damping: 20,
@@ -107,8 +109,8 @@ const MealWeightSlider = ({
                     <View style={styles.sliderSection}>
                         <Slider
                             style={styles.slider}
-                            minimumValue={50}
-                            maximumValue={800}
+                            minimumValue={0}
+                            maximumValue={GRAM_SLIDER_MAX}
                             step={10}
                             value={grams}
                             onValueChange={setGrams}
@@ -117,8 +119,8 @@ const MealWeightSlider = ({
                             thumbTintColor="#16A34A"
                         />
                         <View style={styles.sliderMarkers}>
-                            <Text style={styles.markerText}>50g</Text>
-                            <Text style={styles.markerText}>800g</Text>
+                            <Text style={styles.markerText}>0g</Text>
+                            <Text style={styles.markerText}>{GRAM_SLIDER_MAX}g</Text>
                         </View>
                     </View>
 

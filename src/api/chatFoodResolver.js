@@ -1,6 +1,8 @@
 import { searchFoodWithScores } from './usdaApi';
 import { validateKcalPer100 } from './nutritionValidation';
 import { normalizeExtractorItem } from './foodQuantityNormalize';
+import { attachPortionGuesses, buildHeuristicPortionGuessForDisplayName } from '../utils/standardPortionGuess';
+import { buildFoodQuantityAssignment } from '../utils/userMessageFoodBinding';
 
 function throwIfAborted(signal) {
   if (signal?.aborted) {
@@ -40,10 +42,12 @@ export const HEBREW_FOOD_SEARCH_MAP = {
   תפוז: 'orange raw',
   עגבנייה: 'tomato raw',
   מלפפון: 'cucumber raw',
+  זיתים: 'olives green pickled',
+  זית: 'olives green pickled',
   גזר: 'carrot raw',
   גבינה: 'cheese cheddar',
   'גבינה צהובה': 'cheese cheddar',
-  חלב: 'milk whole',
+  חלב: 'milk whole 3.25 milkfat',
   סטייק: 'beef steak cooked',
   בקר: 'beef cooked',
   'חטיף חלבון': 'protein bar',
@@ -76,6 +80,7 @@ const FALLBACK_HEBREW = {
   עוף: { kcal100: 165, protein100: 31, fat100: 3.6, carbs100: 0, en: 'chicken breast (estimate)' },
   'חזה עוף': { kcal100: 165, protein100: 31, fat100: 3.6, carbs100: 0, en: 'chicken breast (estimate)' },
   'חטיף חלבון': { kcal100: 380, protein100: 30, fat100: 12, carbs100: 35, en: 'protein bar (estimate)' },
+  חלב: { kcal100: 61, protein100: 3.2, fat100: 3.3, carbs100: 4.8, en: 'whole milk (estimate)' },
 };
 
 export const MAX_FOODS_PER_MESSAGE = 12;
@@ -217,7 +222,7 @@ async function lookupFirstValidated(name) {
   for (const cand of scored) {
     if (validateKcalPer100(name, cand.name, cand.calories).ok) return cand;
   }
-  return scored[0] ?? null;
+  return null;
 }
 
 function emojiForFood(name) {
@@ -278,6 +283,42 @@ export async function enrichAddFoodFoods(foodsInput, options = {}) {
     estimateFallbackCount: estimateCount,
     hasAnythingSaved: resolvedFoods.length > 0,
   };
+}
+
+/**
+ * Portion-confirm card items: USDA per-100g + locked grams from user text or heuristic guess.
+ */
+export async function buildConfirmPortionItemsFromUserMessage(
+  userText,
+  foodsFromModel,
+  options = {},
+) {
+  const { signal } = options;
+  throwIfAborted(signal);
+
+  const raw = Array.isArray(foodsFromModel) ? foodsFromModel : [];
+  const meta = buildFoodQuantityAssignment(userText, raw);
+  const hinted = await prefillAskQuantityHints(raw.map((f) => ({ name: f?.name })));
+
+  return hinted.map((h, i) => {
+    const m = meta[i];
+    const grams = m?.userAssignedGrams;
+    if (grams != null) {
+      const guessBase = buildHeuristicPortionGuessForDisplayName(h.name);
+      return {
+        ...h,
+        portionGuess: {
+          ...guessBase,
+          defaultGrams: grams,
+          minGrams: grams,
+          maxGrams: grams,
+          step: 1,
+          summaryLine: `${grams} גרם (כמו שכתבתם בהודעה)`,
+        },
+      };
+    }
+    return attachPortionGuesses([h])[0];
+  });
 }
 
 export async function prefillAskQuantityHints(foodsInput) {

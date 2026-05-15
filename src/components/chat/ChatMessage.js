@@ -19,7 +19,7 @@ const SPRING_CONFIG = {
 const BRAND = '#32A728';
 
 /** ממיר **מודגש** ל־Text מקונן — בלי להציג את כתבי ה־markdown */
-function BubbleRichText({ text, isBot, isNote }) {
+export function BubbleRichText({ text, isBot, isNote }) {
   const baseStyle = isNote
     ? [styles.brachotNote]
     : [styles.text, isBot ? styles.botText : styles.userText];

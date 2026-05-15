@@ -69,11 +69,30 @@ const OPTIONAL_SPICE_PRESETS = {
   ],
 };
 
-function inferKind(haystack) {
+/**
+ * שייק חלבון / משקה — "חלבון" כאן לא אומר ביצים.
+ * משתמשים גם בשם הארוחה כי לפעמים רק שם המנה מכיל "שייק".
+ */
+function isBeverageOrShake(haystack, mealName) {
+  const s = `${mealName || ''} ${haystack}`.trim();
+  if (!s) return false;
+  const shakeCue =
+    /שייק|סמוטי|smoothie|נוזל חלבון|חלבון מהיר|בלנדר|latte|קפה|אספרסו|תה(?:\s|$)|משקה|לשתות/i.test(
+      s,
+    );
+  const proteinDrinkCue =
+    /אבקת חלבון|אבקת\s*חלבון|whey|protein|פרוטאין|מי\s*גבינה/i.test(s) &&
+    /חלב|מים|מיץ|קרח|נוזל|milk|\bml\b|מ״ל/i.test(s);
+  return shakeCue || proteinDrinkCue;
+}
+
+function inferKind(haystack, mealName = '') {
   const s = haystack;
+  if (isBeverageOrShake(haystack, mealName)) return 'beverage';
   if (/סלמון|טונה|דג|פילה|פיש|טרוטה|מושט/.test(s)) return 'fish';
   if (/חזה עוף|עוף|הודו|שוק עוף|כנף|שניצל|סטייק|בשר|טחון/.test(s)) return 'meat_poultry';
-  if (/ביצים|חביתה|שקשוקה|חלבון/.test(s)) return 'eggs';
+  // "חלבון" לבד תופס גם "אבקת חלבון" — רק מנות ביצה אמיתיות
+  if (/ביצים|חביתה|שקשוקה|עיניים|ביצה\b/.test(s)) return 'eggs';
   if (/יוגורט|קוטג׳|גריק|גבינה|קוטג׳|שמנת חמוצה/.test(s)) return 'dairy';
   if (/פסטה|ספגטי|פנה|נודלס|רביולי/.test(s)) return 'pasta';
   if (/אורז|קינואה|בורגול|שעורה|פריקה/.test(s)) return 'grain';
@@ -82,6 +101,7 @@ function inferKind(haystack) {
 }
 
 function pickSpices(kind) {
+  if (kind === 'beverage') return OPTIONAL_SPICE_PRESETS.dairy_fruit;
   if (kind === 'fish') return OPTIONAL_SPICE_PRESETS.fish;
   if (kind === 'eggs') return OPTIONAL_SPICE_PRESETS.eggs;
   if (kind === 'dairy') return OPTIONAL_SPICE_PRESETS.dairy_fruit;
@@ -97,35 +117,52 @@ function pickSpices(kind) {
 
 function estimateMinutes(kind, itemCount) {
   const base =
-    kind === 'fish'
-      ? 18
-      : kind === 'meat_poultry'
-        ? 28
-        : kind === 'eggs'
-          ? 12
-          : kind === 'pasta'
-            ? 22
-            : kind === 'grain'
-              ? 26
-              : kind === 'salad'
-                ? 15
-                : kind === 'dairy'
-                  ? 10
-                  : 22;
+    kind === 'beverage'
+      ? 5
+      : kind === 'fish'
+        ? 18
+        : kind === 'meat_poultry'
+          ? 28
+          : kind === 'eggs'
+            ? 12
+            : kind === 'pasta'
+              ? 22
+              : kind === 'grain'
+                ? 26
+                : kind === 'salad'
+                  ? 15
+                  : kind === 'dairy'
+                    ? 10
+                    : 22;
   const hi = base + Math.min(15, itemCount * 2);
-  const lo = Math.max(10, base - 8);
-  return `${lo}–${hi}`;
+  const loFloor = kind === 'beverage' ? 2 : 10;
+  let lo = Math.max(loFloor, base - 8);
+  let hiAdj = hi;
+  if (lo > hiAdj) hiAdj = lo + Math.max(2, itemCount);
+  return `${lo}–${hiAdj}`;
 }
 
 function buildSteps(kind, items) {
   const haystack = foodsHaystack(items);
   const hasCarb = /אורז|פסטה|קינואה|בטטה|תפוח אדמה|לחם|פיתה|בורגול/.test(haystack);
   const hasVeg = /ירק|סלט|ברוקולי|גזר|בצל|עגבנייה|מלפפון|פלפל/.test(haystack);
+  const hasMeatFishPoultry = /סלמון|טונה|דג|פילה|חזה עוף|עוף|בשר|שניצל/.test(haystack);
 
   const prep = [
-    'סדר את כל הרכיבים על משטח נקי. אם יש עוף/בשר/דג קירור — הוצא מהמקרר כ‑15 דק׳ לפני בישול כדי לצלייה אחידה.',
+    hasMeatFishPoultry
+      ? 'סדר את כל הרכיבים על משטח נקי. אם יש עוף/בשר/דג קירור — הוצא מהמקרר כ‑15 דק׳ לפני בישול כדי לצלייה אחידה.'
+      : 'סדר את כל הרכיבים על משטח נקי — רק מה שמופיע ברשימה.',
     'שקול או מדוד כמויות לפי הרשימה. במנה משולבת התחל מהרכיב הארוך ביותר בזמן (פסטה/אורז או רוטב בסיס).',
   ];
+
+  const beverage = [
+    'מזג נוזלים (חלב/מים/מיץ לפי הרשימה) לכד בלנדר או לשייקר; אם מתכון קר — קרח בתחילה או אחרי טחינה קצרה.',
+    'הוסף את האבקות (חלבון/קקאו וכו׳) לפי הסדר: קודם נוזלים קצת, אחר כך האבקה — פחות גושים.',
+    'הרץ את הבלנדר 15–45 שניות עד מרקם חלק; אם צפוף מדי — טיפת נוזל נוסף; אם דליל — עוד קרח או חצי מנה אבקה.',
+    'טעם: התחל בלי מתוק; הוסף קינמון/וניל/דבש רק אחרי טעימה ראשונה.',
+  ];
+  const beverageFinish =
+    'טעימה אחרונה והגשה מיד; שייק נשתה טרי. אם נשארה כמות קטנה — במקרר עד כמה שעות ובערבוב קצר לפני השתייה.';
 
   const poultryCook = [
     'חמם מחבת או תבנית על חום בינוני‑גבוה (או תנור ל‑190°C לצלייה). הוסף כף עד שתיים שמן זית.',
@@ -190,6 +227,14 @@ function buildSteps(kind, items) {
   ];
 
   let core = [];
+  if (kind === 'beverage') {
+    core = [
+      { label: 'שלב 1', text: prep[0] },
+      ...beverage.map((line, i) => ({ label: `שלב ${i + 2}`, text: line })),
+      { label: `שלב ${beverage.length + 2}`, text: beverageFinish },
+    ];
+    return core;
+  }
   if (kind === 'fish') {
     core = [...prep.slice(0, 1), ...fishCook, ...assemble, ...finish];
   } else if (kind === 'meat_poultry') {
@@ -227,7 +272,7 @@ export function buildMealRecipeDraft(meal) {
   const title = meal.name || 'ארוחה';
   const ingredients = items.map(formatAmountLine);
   const haystack = foodsHaystack(items);
-  const kind = inferKind(haystack);
+  const kind = inferKind(haystack, title);
 
   const spiceLines = pickSpices(kind);
 

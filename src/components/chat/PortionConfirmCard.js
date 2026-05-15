@@ -10,21 +10,119 @@ import {
   Platform,
 } from 'react-native';
 import Slider from '@react-native-community/slider';
-import { buildFoodsFromPortionDrafts, gramsFromPortionDraft } from '../../utils/standardPortionGuess';
+import {
+  buildFoodsFromPortionDrafts,
+  gramsFromPortionDraft,
+  portionGramTickLabels,
+  portionUnitTickLabels,
+} from '../../utils/standardPortionGuess';
+import { BubbleRichText } from './ChatMessage';
 
 const BRAND = '#32A728';
+const SLIDER_ABS_MAX = 800;
+
+function gramSliderBounds(guess, fallbackDefault) {
+  const g = guess || {};
+  const defRaw = g.defaultGrams ?? fallbackDefault;
+  const def = Math.min(Math.max(defRaw, 0), SLIDER_ABS_MAX);
+  let minG = Math.max(0, g.minGrams ?? 0);
+  let maxG =
+    g.maxGrams != null ? Math.min(g.maxGrams, SLIDER_ABS_MAX) : SLIDER_ABS_MAX;
+
+  if (minG === maxG) {
+    return { minG, maxG: minG, def };
+  }
+  if (maxG <= minG) {
+    maxG = Math.min(SLIDER_ABS_MAX, Math.max(minG + 10, def, 50));
+  }
+  return { minG, maxG, def };
+}
+
+/** שורה עליונה: משקל/יח׳ משוערים; שורה תחתונה: מילת כלי אחת */
+function GramTickStrip({ tickLabels }) {
+  return (
+    <View style={styles.tickStrip} accessibilityElementsHidden accessibilityLabel="">
+      <View style={styles.tickMarksRow}>
+        {(tickLabels || []).map((label, idx) => {
+          const raw = String(label ?? '');
+          const i = raw.indexOf('\n');
+          const measure = i === -1 ? raw.trim() : raw.slice(0, i).trim();
+          const word = i === -1 ? '' : raw.slice(i + 1).trim();
+          return (
+            <View key={`g_${idx}_${measure}_${word}`} style={styles.tickSlot}>
+              <View style={styles.tickMark} />
+              {measure ? (
+                <Text
+                  style={styles.tickMeasure}
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.85}
+                >
+                  {measure}
+                </Text>
+              ) : null}
+              {word ? (
+                <Text style={styles.tickWord} numberOfLines={1}>
+                  {word}
+                </Text>
+              ) : null}
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
+
+function UnitTickStrip({ tickLabels }) {
+  return (
+    <View style={styles.tickStrip} accessibilityElementsHidden accessibilityLabel="">
+      <View style={styles.tickMarksRow}>
+        {(tickLabels || []).map((label, idx) => {
+          const raw = String(label ?? '');
+          const i = raw.indexOf('\n');
+          const measure = i === -1 ? raw.trim() : raw.slice(0, i).trim();
+          const word = i === -1 ? '' : raw.slice(i + 1).trim();
+          return (
+            <View key={`u_${idx}_${measure}_${word}`} style={styles.tickSlot}>
+              <View style={styles.tickMark} />
+              {measure ? (
+                <Text
+                  style={styles.tickMeasure}
+                  numberOfLines={1}
+                  adjustsFontSizeToFit
+                  minimumFontScale={0.85}
+                >
+                  {measure}
+                </Text>
+              ) : null}
+              {word ? (
+                <Text style={styles.tickWord} numberOfLines={1}>
+                  {word}
+                </Text>
+              ) : null}
+            </View>
+          );
+        })}
+      </View>
+    </View>
+  );
+}
 
 function initialDrafts(items) {
   return (items || []).map((it) => {
     const g = it.portionGuess;
     if (!g || g.mode === 'grams') {
-      return { mode: 'grams', grams: g?.defaultGrams ?? 150 };
+      const { def, minG, maxG } = gramSliderBounds(g, 150);
+      const raw = g?.defaultGrams ?? def;
+      const grams = Math.min(Math.max(raw, minG), maxG);
+      return { mode: 'grams', grams };
     }
     return { mode: 'units', units: g.defaultUnits ?? 1 };
   });
 }
 
-function PortionConfirmCard({ items, locked, onApplied }) {
+function PortionConfirmCard({ introText, items, locked, onApplied }) {
   const [adjustOpen, setAdjustOpen] = useState(false);
   const [drafts, setDrafts] = useState(() => initialDrafts(items));
 
@@ -41,6 +139,7 @@ function PortionConfirmCard({ items, locked, onApplied }) {
     async (d) => {
       if (locked) return;
       const foods = buildFoodsFromPortionDrafts(items, d);
+      if (!foods.length) return;
       await onApplied?.(foods);
     },
     [items, locked, onApplied]
@@ -53,13 +152,19 @@ function PortionConfirmCard({ items, locked, onApplied }) {
     setAdjustOpen(false);
   }, [applyWithDrafts, drafts]);
 
-  const updateDraftGrams = useCallback((index, grams) => {
-    setDrafts((prev) => {
-      const next = [...prev];
-      next[index] = { ...next[index], grams };
-      return next;
-    });
-  }, []);
+  const updateDraftGrams = useCallback(
+    (index, grams) => {
+      const guess = items[index]?.portionGuess;
+      const { minG, maxG } = gramSliderBounds(guess, 150);
+      const g = Math.min(Math.max(grams, minG), maxG);
+      setDrafts((prev) => {
+        const next = [...prev];
+        next[index] = { ...next[index], grams: g };
+        return next;
+      });
+    },
+    [items]
+  );
 
   const updateDraftUnits = useCallback((index, units) => {
     setDrafts((prev) => {
@@ -72,7 +177,17 @@ function PortionConfirmCard({ items, locked, onApplied }) {
   return (
     <>
       <View style={[styles.card, locked && styles.cardLocked]} accessibilityRole="summary">
-        <View style={styles.actionsRow}>
+        {typeof introText === 'string' && introText.trim() ? (
+          <View style={styles.introWrap} accessibilityRole="text">
+            <BubbleRichText text={introText.trim()} isBot />
+          </View>
+        ) : null}
+        <View
+          style={[
+            styles.actionsRow,
+            typeof introText === 'string' && introText.trim() ? styles.actionsRowAfterIntro : null,
+          ]}
+        >
           <TouchableOpacity
             style={[styles.btnPrimary, locked && styles.btnDisabled]}
             onPress={onYes}
@@ -106,9 +221,7 @@ function PortionConfirmCard({ items, locked, onApplied }) {
         <Pressable style={styles.modalBackdrop} onPress={closeAdjust}>
           <Pressable style={styles.sheet} onPress={(e) => e.stopPropagation?.()}>
             <Text style={styles.sheetTitle}>כוונון כמות</Text>
-            <Text style={styles.sheetHint}>
-              גררו את הסרגל או בחרו מספר יחידות — ההערכה משמשת לחישוב קלוריות.
-            </Text>
+            <Text style={styles.sheetHint}>גררו. אפשר גם לכתוב בצ׳אט.</Text>
             <ScrollView
               style={styles.sheetScroll}
               keyboardShouldPersistTaps="handled"
@@ -119,14 +232,31 @@ function PortionConfirmCard({ items, locked, onApplied }) {
                 const name = it.name || 'מזון';
                 if (!guess || guess.mode === 'grams') {
                   const g = guess || {};
-                  const minG = g.minGrams ?? 50;
-                  const maxG = g.maxGrams ?? 400;
+                  const { minG, maxG } = gramSliderBounds(g, 150);
                   const step = g.step ?? 10;
-                  const val = drafts[i]?.grams ?? g.defaultGrams ?? 150;
+                  const rawVal = drafts[i]?.grams ?? g.defaultGrams ?? 150;
+                  const val = Math.min(Math.max(rawVal, minG), maxG);
+                  const isLiquid = g.scaleMode === 'liquid';
+                  const perMl = g.gramsPerMl > 0 ? g.gramsPerMl : 1;
+                  const displayMlNow = Math.round(val / perMl);
+                  const gramTickLabels = portionGramTickLabels(g, { minG, maxG }, name);
+
                   return (
                     <View key={`${name}_${i}`} style={styles.block}>
                       <Text style={styles.blockTitle}>{name}</Text>
-                      <Text style={styles.blockValue}>{Math.round(val)} גרם</Text>
+                      <Text style={styles.amountRow} accessibilityLiveRegion="polite">
+                        {isLiquid ? (
+                          <>
+                            <Text style={styles.amountValue}>{displayMlNow}</Text>
+                            <Text style={styles.amountUnit}> מ״ל</Text>
+                          </>
+                        ) : (
+                          <>
+                            <Text style={styles.amountValue}>{Math.round(val)}</Text>
+                            <Text style={styles.amountUnit}> גרם</Text>
+                          </>
+                        )}
+                      </Text>
                       <Slider
                         style={styles.slider}
                         minimumValue={minG}
@@ -138,18 +268,28 @@ function PortionConfirmCard({ items, locked, onApplied }) {
                         maximumTrackTintColor="#E2E8F0"
                         thumbTintColor={BRAND}
                       />
+                      <GramTickStrip tickLabels={gramTickLabels} />
+                      {isLiquid ? (
+                        <Text style={styles.gramEquivMuted}>~{Math.round(val)} גרם</Text>
+                      ) : null}
                     </View>
                   );
                 }
-                const minU = guess.minUnits ?? 1;
+                const minU = 0;
                 const maxU = guess.maxUnits ?? 8;
                 const u = drafts[i]?.units ?? guess.defaultUnits ?? 1;
                 const est = gramsFromPortionDraft(it, drafts[i]);
+                const unitTickLabels = portionUnitTickLabels(guess, { minU, maxU });
                 return (
                   <View key={`${name}_${i}`} style={styles.block}>
                     <Text style={styles.blockTitle}>{name}</Text>
-                    <Text style={styles.blockValue}>
-                      {Math.round(u)} {u === 1 ? 'יחידה' : 'יחידות'} (~{est} גרם)
+                    <Text style={styles.amountRow} accessibilityLiveRegion="polite">
+                      <Text style={styles.amountValue}>{Math.round(u)}</Text>
+                      <Text style={styles.amountUnit}>
+                        {u === 1 ? ' יחידה · ' : ' יחידות · '}
+                      </Text>
+                      <Text style={styles.amountValue}>~{est}</Text>
+                      <Text style={styles.amountUnit}> גרם</Text>
                     </Text>
                     <Slider
                       style={styles.slider}
@@ -162,6 +302,7 @@ function PortionConfirmCard({ items, locked, onApplied }) {
                       maximumTrackTintColor="#E2E8F0"
                       thumbTintColor={BRAND}
                     />
+                    <UnitTickStrip tickLabels={unitTickLabels} />
                   </View>
                 );
               })}
@@ -206,7 +347,14 @@ const styles = StyleSheet.create({
   actionsRow: {
     flexDirection: 'row-reverse',
     gap: 10,
-    justifyContent: 'stretch',
+    width: '100%',
+  },
+  actionsRowAfterIntro: {
+    marginTop: 14,
+  },
+  introWrap: {
+    alignSelf: 'stretch',
+    width: '100%',
   },
   btnPrimary: {
     flex: 1,
@@ -266,33 +414,99 @@ const styles = StyleSheet.create({
   },
   sheetHint: {
     fontSize: 13,
-    lineHeight: 19,
+    lineHeight: 18,
     color: '#64748B',
     textAlign: 'right',
-    marginBottom: 14,
+    marginBottom: 12,
   },
   sheetScroll: {
     maxHeight: 420,
   },
   block: {
-    marginBottom: 20,
+    marginBottom: 22,
   },
   blockTitle: {
     fontSize: 15,
     fontWeight: '700',
     color: '#0F172A',
     textAlign: 'right',
-    marginBottom: 4,
+    marginBottom: 6,
   },
-  blockValue: {
-    fontSize: 14,
-    color: '#475569',
+  amountRow: {
+    flexDirection: 'row-reverse',
+    alignItems: 'baseline',
+    justifyContent: 'flex-start',
+    marginBottom: 6,
     textAlign: 'right',
-    marginBottom: 8,
+    flexWrap: 'wrap',
+    width: '100%',
+  },
+  amountValue: {
+    fontSize: 28,
+    fontWeight: '700',
+    color: '#0F172A',
+    fontVariant: ['tabular-nums'],
+  },
+  amountUnit: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#64748B',
+  },
+  gramEquivMuted: {
+    marginTop: 4,
+    fontSize: 12,
+    color: '#94A3B8',
+    textAlign: 'right',
+    fontVariant: ['tabular-nums'],
   },
   slider: {
     width: '100%',
     height: 40,
+    marginBottom: 2,
+  },
+  tickStrip: {
+    marginTop: 6,
+    paddingHorizontal: 4,
+    width: '100%',
+  },
+  tickMarksRow: {
+    flexDirection: 'row',
+    width: '100%',
+    justifyContent: 'space-between',
+    alignItems: 'flex-start',
+  },
+  tickSlot: {
+    flex: 1,
+    alignItems: 'center',
+    paddingHorizontal: 0,
+    minWidth: 0,
+    maxWidth: '20%',
+  },
+  tickMark: {
+    width: 2,
+    height: 8,
+    borderRadius: 1,
+    backgroundColor: '#CBD5E1',
+    marginBottom: 4,
+    alignSelf: 'center',
+  },
+  tickMeasure: {
+    fontSize: 11,
+    lineHeight: 13,
+    fontWeight: '700',
+    color: '#1E293B',
+    fontVariant: ['tabular-nums'],
+    textAlign: 'center',
+    width: '100%',
+  },
+  tickWord: {
+    fontSize: 10,
+    lineHeight: 12,
+    fontWeight: '500',
+    color: '#64748B',
+    textAlign: 'center',
+    marginTop: 2,
+    width: '100%',
   },
   sheetActions: {
     flexDirection: 'row-reverse',

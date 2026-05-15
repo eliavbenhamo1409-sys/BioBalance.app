@@ -5,9 +5,10 @@
 // Now powered by Gemini 3 Flash + USDA FoodData Central for accurate nutrition data!
 
 import { callGemini, RateLimitError } from './geminiClient';
-import { enrichAddFoodFoods, formatFoodLoggedReply } from './chatFoodResolver';
+import { enrichAddFoodFoods, formatFoodLoggedReply, buildConfirmPortionItemsFromUserMessage } from './chatFoodResolver';
 import { searchFood } from './usdaApi';
 import { userMessageImpliesFoodQuantity } from '../utils/userMessageQuantityHints';
+import { addFoodNeedsPortionConfirm } from '../utils/userMessageFoodBinding';
 
 function throwIfAborted(signal) {
   if (signal?.aborted) {
@@ -23,7 +24,7 @@ const devLog = (...args) => {
   if (__DEV__) _chatLog(...args);
 };
 
-function newMealGroupId() {
+export function newMealGroupId() {
   if (typeof globalThis !== 'undefined' && globalThis.crypto?.randomUUID) {
     return globalThis.crypto.randomUUID();
   }
@@ -154,6 +155,42 @@ export const processUserMessage = async (userMessage, context) => {
           'לא הצלחתי לרשום מההודעה. שלח שוב או נסח מחדש.',
         action: null,
       };
+    }
+
+    // Mixed messages: some foods have explicit grams, others not → portion card for all (locked grams for known).
+    if (result.action?.type === 'add_food' && result.action.data?.foods?.length) {
+      const needsPc = addFoodNeedsPortionConfirm(userMessage, result.action.data.foods);
+      devLog(
+        '🧮 Portion confirm check:',
+        needsPc,
+        result.action.data.foods.map((f) => f.name).join(', '),
+      );
+      if (needsPc) {
+        try {
+          throwIfAborted(signal);
+          const items = await buildConfirmPortionItemsFromUserMessage(
+            userMessage,
+            result.action.data.foods,
+            { signal },
+          );
+          const wg = Number(result.action.data.water_glasses) || 0;
+          result = {
+            intent: result.intent || INTENTS.REPORT_FOOD,
+            response: '',
+            action: {
+              type: 'confirm_portions',
+              data: {
+                items,
+                water_glasses: wg,
+                source_message_text: String(userMessage).slice(0, 500),
+              },
+            },
+          };
+        } catch (e) {
+          if (e?.code === 'USER_CANCEL') throw e;
+          devLog('confirm_portions branch:', e.message);
+        }
+      }
     }
 
     // Deterministic USDA + validation: model extracts name + quantity + unit (or legacy grams) — no LLM kcal for add_food
@@ -454,12 +491,23 @@ const buildSystemPrompt = (context, usdaData = '') => {
   // Pending action context
   let pendingContext = '';
   if (pendingAction?.type === 'waiting_quantity') {
-    const foodNames = pendingAction.foods.map(f => f.name).join(', ');
+    const foodNames = pendingAction.foods.map((f) => f.name).join(', ');
     pendingContext = `
-⚠️ ממתינים לכמות עבור: ${foodNames}
-למשתמש יוצג כרטיס «הוסף / לא» עם מנות סטנדרט — אם הוא עונה במספרים בצ'אט, זו כנראה כמות בגרם.
-אם הוא כותב "כן"/"אישור" — השתמש במשקל ברירת המחדל מההקשר (יחידות או גרם שהוגדרו במערכת).
-אם "לא"/"ביטול" — בטל.
+⚠️ הקשר: ממתינים לכמות / אישור למאכל(ים): **${foodNames}**
+המשתמש רואה כרטיס עם **הוסף** / **לא** — ולחיצה על **לא** פותחת **סרגל התאמת משקל בגרם** (או כוונון יחידות כשמוצג).
+
+📩 אם המשתמש כותב **בצ'אט**:
+• **מספרים** (למשל "200", "200 גרם", "בערך מ־80") — פרש כמות למאכל(ים) הממתינים (סדר כמו ברשימה למעלה כשיש כמה).
+• **בלי מספרים — תיאור בשפת דיבור** ("כוס חד פעמי של זיתים", "חצי קערה", "חופן גדול") — **חובה להמיר בעצמך לגרמים משוערים** ולרשום.
+
+🎯 **איך להחזיר JSON (בחר אחת):**
+1. **מומלץ:** \`"intent": "report_food"\` ו־action \`"add_food"\` עם \`foods\`: לכל מאכל ממתין פריט עם **אותו שם עברי** (מתאים לרשימה: "זיתים" ≈ "זית") + שדה נומרי **grams** = ההערכה שלך מתוך התיאור (למשל כוס חד־פעמי זיתים עם נוזל ≈ ‎100–‎140 גרם למתכוונים ל\"רק זיתים\"; חופן זיתים חמוץ ≈ ‎30–‎40 גרם).
+2. **חלופה:** \`"intent": "provide_quantity"\` ו־ב־action:
+\`{ "type": "grams_for_pending", "data": { "grams": [ מספר1, מספר2, ... ] } }\`
+אותו סדר כמו המאכלים הממתינים; ב־response אפשר משפט קצר בעברית עם המשקל שהבנת.
+
+⛔ אל תסווג הודעת כמות כ־**cancel** ("לא") רק בגלל שהמילה מופיעה — **cancel** רק אם המשתמש **מבטל** בפירוש (למשל "תשכח מזה", "בטל", "עזוב את הרישום"). "לא" בהקשר של דיוק כמות = כמות לא מדויקת **או** כוונון — לא ביטול דיאלוג אם יש תיאור נפח במשפט אחר.
+• **confirm** ("כן"/"אישור") — רק כשאין כמות חדשה בהודעה: נשענים על ההנחה מהכרטיס (**ברירות המחדל** שכבר הוצעו).
 `;
   }
 

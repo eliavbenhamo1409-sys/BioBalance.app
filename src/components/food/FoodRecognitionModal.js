@@ -13,12 +13,15 @@ import Slider from '@react-native-community/slider';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 
+const GRAM_SLIDER_MAX = 400;
+
 const FoodRecognitionModal = ({ isOpen, onClose, foodData, isLoading, onConfirm }) => {
   const [grams, setGrams] = useState(150);
 
   useEffect(() => {
     if (foodData?.estimated_portion_grams) {
-      setGrams(foodData.estimated_portion_grams);
+      const g = foodData.estimated_portion_grams;
+      setGrams(Math.min(Math.max(g, 0), GRAM_SLIDER_MAX));
     }
   }, [foodData]);
 
@@ -99,8 +102,8 @@ const FoodRecognitionModal = ({ isOpen, onClose, foodData, isLoading, onConfirm 
                 </View>
                 <Slider
                   style={styles.slider}
-                  minimumValue={10}
-                  maximumValue={500}
+                  minimumValue={0}
+                  maximumValue={GRAM_SLIDER_MAX}
                   step={10}
                   value={grams}
                   onValueChange={setGrams}
@@ -109,8 +112,8 @@ const FoodRecognitionModal = ({ isOpen, onClose, foodData, isLoading, onConfirm 
                   thumbTintColor="#16A34A"
                 />
                 <View style={styles.sliderMarkers}>
-                  <Text style={styles.markerText}>10g</Text>
-                  <Text style={styles.markerText}>500g</Text>
+                  <Text style={styles.markerText}>0g</Text>
+                  <Text style={styles.markerText}>{GRAM_SLIDER_MAX}g</Text>
                 </View>
               </View>
 

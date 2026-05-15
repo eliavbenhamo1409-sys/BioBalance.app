@@ -41,7 +41,7 @@ import Animated, {
 } from 'react-native-reanimated';
 import { base44 } from '../api/base44Client';
 import { chatWithBot, analyzeFoodFromImage, parseFoodFromText, estimate3DWeight } from '../api/aiClient';
-import { processUserMessage, INTENTS, getGreeting, getSmartFollowUp } from '../api/smartChatbot';
+import { processUserMessage, INTENTS, getGreeting, getSmartFollowUp, newMealGroupId } from '../api/smartChatbot';
 import { prefillAskQuantityHints } from '../api/chatFoodResolver';
 import {
   attachPortionGuesses,
@@ -169,6 +169,32 @@ const SPRING_CONFIG = {
   restDisplacementThreshold: 0.001,
   restSpeedThreshold: 0.001,
 };
+
+/** True when chat-resolved food names overlap pending portion-confirm foods (clear stale pending). */
+function portionPendingOverlapsIncoming(pendingFoods, resolvedFoodRows) {
+  const norm = (s) =>
+    String(s ?? '')
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .replace(/['׳]/g, '');
+
+  const pendingNs = (pendingFoods || []).map((f) => norm(f?.name)).filter(Boolean);
+  const incomingNs = (resolvedFoodRows || []).map((f) => norm(f?.name)).filter(Boolean);
+  if (!pendingNs.length || !incomingNs.length) return false;
+
+  const overlaps = (a, b) =>
+    !!(a &&
+      b &&
+      (a === b ||
+        (a.length >= 2 &&
+          b.length >= 2 &&
+          (a.includes(b) || b.includes(a)))));
+
+  return incomingNs.some((iname) =>
+    pendingNs.some((pname) => overlaps(pname, iname)),
+  );
+}
 
 export default function Home() {
   const navigation = useNavigation();
@@ -1189,12 +1215,69 @@ export default function Home() {
     setChatGenAbortable(true);
 
     try {
-      // Build context for smart chatbot
+      // Build context for smart chatbot.
+      // IMPORTANT: structured UI cards (portion_confirm/food_card/recipe_card/meal_plan/brachot_advice)
+      // carry long Hebrew template text the model can mimic, breaking JSON-mode replies.
+      // Replace those with a short placeholder so the LLM doesn't echo our UI copy back as plain text.
+      const STRUCTURED_BOT_TYPES = new Set([
+        'portion_confirm',
+        'food_card',
+        'recipe_card',
+        'recipe_save_banner',
+        'meal_plan',
+        'brachot_advice',
+      ]);
+      const placeholderForType = (t) => {
+        switch (t) {
+          case 'portion_confirm':
+            return '[ממשק: הוצג כרטיס אישור מנה (כפתור הוסף / לא)]';
+          case 'food_card':
+            return '[ממשק: הוצג כרטיס מנה שנרשמה]';
+          case 'recipe_card':
+            return '[ממשק: הוצג כרטיס מתכון]';
+          case 'recipe_save_banner':
+            return '[ממשק: הוצעה שמירת מתכון]';
+          case 'meal_plan':
+            return '[ממשק: הוצגה תפריט יומי]';
+          case 'brachot_advice':
+            return '[ממשק: הוצגה ברכה]';
+          default:
+            return '';
+        }
+      };
+
+      // Older sessions saved plain-text bot bubbles that contain the same UI
+      // template (e.g. "לחצו על הכפתור הירוק הוסף", "תיפתח שקופית עם סרגל").
+      // If we feed that back, the LLM mimics it and stops returning JSON.
+      // Strip / shorten any bot text that smells like UI copy.
+      const UI_LEAK_PATTERNS = [
+        /לחצו\s*על\s*הכפתור/i,
+        /תיפתח\s*שקופית/i,
+        /רוצה\s*לוודא\s*איתכם/i,
+        /הכפתור\s*הירוק/i,
+      ];
+      const sanitizeBotText = (raw) => {
+        const t = String(raw || '').trim();
+        if (!t) return '';
+        if (UI_LEAK_PATTERNS.some((re) => re.test(t))) {
+          return '[ממשק: הוצג כרטיס אישור מנה (כפתור הוסף / לא)]';
+        }
+        return t.length > 280 ? `${t.slice(0, 280)}…` : t;
+      };
+
       const context = {
-        conversationHistory: messages.slice(-10).map(m => ({
-          isBot: m.isBot,
-          text: m.text || ''
-        })),
+        conversationHistory: messages
+          .slice(-10)
+          .map((m) => {
+            if (m.isBot && STRUCTURED_BOT_TYPES.has(m.type)) {
+              return { isBot: true, text: placeholderForType(m.type) };
+            }
+            if (m.isBot) {
+              return { isBot: true, text: sanitizeBotText(m.text) };
+            }
+            return { isBot: false, text: String(m.text || '').slice(0, 500) };
+          })
+          .filter((m) => m.text && m.text.length > 0),
         pendingAction: pendingFoods.length > 0 ? {
           type: 'waiting_quantity',
           foods: pendingFoods,
@@ -1276,7 +1359,8 @@ export default function Home() {
       typeof lastUserText === 'string' && userMessageImpliesFoodQuantity(lastUserText);
 
     const skipResponseBubble =
-      action?.type === 'ask_quantity' && !quantityCueInMessage;
+      (action?.type === 'ask_quantity' && !quantityCueInMessage) ||
+      action?.type === 'confirm_portions';
 
     if (response && !skipResponseBubble) {
       await addBotMessage(response);
@@ -1286,8 +1370,14 @@ export default function Home() {
     if (action) {
       switch (action.type) {
         case 'add_food':
-          // Process foods with nutritional data
           if (action.data?.foods?.length > 0) {
+            const incoming = action.data.foods;
+            if (
+              pendingFoods.length > 0 &&
+              portionPendingOverlapsIncoming(pendingFoods, incoming)
+            ) {
+              setPendingFoods([]);
+            }
             setTimeout(async () => {
               await processReadyFood(action.data.foods, {
                 meal_group_id: action.data.meal_group_id,
@@ -1311,6 +1401,27 @@ export default function Home() {
               await addBotMessage(`💧 נותרו ${remaining} כוסות מים להיום.`);
             }
           }, 800);
+          break;
+
+        case 'confirm_portions':
+          if (action.data?.items?.length > 0) {
+            setPendingFoods(action.data.items);
+            const intro = buildPortionConfirmIntro(action.data.items);
+            const uniqueId = `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+            addMessage({
+              text: intro,
+              isBot: true,
+              id: uniqueId,
+              type: 'portion_confirm',
+              data: {
+                items: action.data.items,
+                batchMeta: {
+                  source_message_text: action.data.source_message_text ?? null,
+                  water_glasses: Number(action.data.water_glasses) || 0,
+                },
+              },
+            });
+          }
           break;
 
         case 'ask_quantity':
@@ -1429,17 +1540,52 @@ export default function Home() {
         break;
 
       case INTENTS.PROVIDE_QUANTITY:
-        // Extract number and process pending foods
         if (pendingFoods.length > 0) {
-          const gramsMatch = result.response?.match(/(\d+)/g) || [];
-          if (gramsMatch.length > 0) {
+          const ad = result.action?.data;
+          const pickFiniteGrams = (n) => {
+            const g = Number(n);
+            return Number.isFinite(g) && g > 0 ? Math.round(g) : null;
+          };
+
+          const fromArray = [];
+          if (Array.isArray(ad?.foods)) {
+            for (const row of ad.foods) {
+              const g = pickFiniteGrams(row?.grams ?? row?.gram);
+              if (g != null) fromArray.push(g);
+            }
+          }
+          if (Array.isArray(ad?.grams)) {
+            for (const val of ad.grams) {
+              const g = pickFiniteGrams(val);
+              if (g != null) fromArray.push(g);
+            }
+          }
+
+          /** @type {number[]} */
+          let gramsList = [...fromArray];
+
+          if (!gramsList.length && typeof result.response === 'string') {
+            const gramHits = [...result.response.matchAll(/(\d+(?:[\.,]\d+)?)\s*גרם/gi)];
+            for (const m of gramHits) {
+              const g = pickFiniteGrams(m[1].replace(',', '.'));
+              if (g != null) gramsList.push(g);
+            }
+          }
+
+          if (!gramsList.length && typeof result.response === 'string') {
+            gramsList = [...result.response.matchAll(/\b\d{2,4}\b/g)]
+              .map((m) => pickFiniteGrams(m[0]))
+              .filter((g) => g != null);
+          }
+
+          if (gramsList.length > 0) {
             const processedFoods = [];
             const currentPendingFoods = [...pendingFoods];
             setPendingFoods([]);
 
             for (let i = 0; i < currentPendingFoods.length; i++) {
               const food = currentPendingFoods[i];
-              const grams = parseInt(gramsMatch[i] || gramsMatch[0]);
+              const grams = gramsList[i] ?? gramsList[0];
               const multiplier = grams / 100;
 
               processedFoods.push({
@@ -1829,14 +1975,22 @@ export default function Home() {
     if (msg.type === 'portion_confirm' && msg.data?.items?.length) {
       return (
         <View key={msg.id || `msg_${index}`} style={{ gap: 8 }}>
-          {msg.text ? <ChatMessage message={msg.text} isBot /> : null}
           <PortionConfirmCard
+            introText={msg.text || ''}
             items={msg.data.items}
             locked={!!appliedPortionIds[msg.id]}
             onApplied={async (foods) => {
               setAppliedPortionIds((prev) => ({ ...prev, [msg.id]: true }));
               setPendingFoods([]);
-              await processReadyFood(foods);
+              const meta = msg.data?.batchMeta || {};
+              await processReadyFood(foods, {
+                meal_group_id: newMealGroupId(),
+                source_message_text: meta.source_message_text ?? null,
+              });
+              const wg = Number(meta.water_glasses) || 0;
+              for (let w = 0; w < wg; w++) {
+                await contextAddWater();
+              }
             }}
           />
         </View>

@@ -135,6 +135,13 @@ const rankUsdARawFoods = (rawFoods, query) => {
     .trim();
   const qWords = q.split(/\s+/).filter((w) => w.length > 1);
 
+  // Core noun the query is really about, used to reject hits from a different
+  // food family that just happened to mention the modifier ("whole milk" → cheese).
+  const queryHeadNoun = qWords[0] || '';
+  const wantsMilk = /\bmilk\b/.test(q) && !/\b(cheese|yogurt|cream)\b/.test(q);
+  const wantsYogurt = /\byogurt\b/.test(q) && !/\bcheese\b/.test(q);
+  const wantsCheese = /\bcheese\b/.test(q);
+
   return rawFoods.map((food, index) => {
     const desc = (food.description || food.lowercaseDescription || '').toLowerCase();
     let score = -index * 0.5;
@@ -152,6 +159,19 @@ const rankUsdARawFoods = (rawFoods, query) => {
     for (const w of qWords) {
       if (desc.includes(w)) score += 12;
       if (new RegExp(`(^|[, ])${w}\\b`).test(desc)) score += 8;
+    }
+
+    // Cross-family rejection: if the query is "milk" but the hit is "cheese"
+    // (or vice-versa), kill it even if it nominally contains the modifier.
+    if (wantsMilk && /\bcheese\b/.test(desc)) score -= 200;
+    if (wantsMilk && /\byogurt\b/.test(desc)) score -= 60;
+    if (wantsYogurt && /\bcheese\b/.test(desc)) score -= 200;
+    if (wantsCheese && /\bmilk\b/.test(desc) && !/cheese/.test(desc)) score -= 60;
+
+    // Bonus when the description's leading noun matches the query's head noun
+    // (e.g. "Milk, ..." for query "milk whole"). Anchored so "Cheese, ... whole milk" loses.
+    if (queryHeadNoun && new RegExp(`^${queryHeadNoun}\\b`, 'i').test(desc)) {
+      score += 30;
     }
 
     if (
