@@ -20,10 +20,13 @@ import RevenueCatUI, { PAYWALL_RESULT } from 'react-native-purchases-ui';
 
 export const PRO_ENTITLEMENT = 'BioBalance Pro';
 
-// Same test key works for iOS and Android in sandbox.
+// Production keys from RevenueCat Dashboard → Project settings → API keys.
+// iOS uses an `appl_...` key (Apple App Store); Android needs a `goog_...`
+// key from Google Play (not yet provisioned, falls back to iOS key so the
+// SDK stays initialised in dev).
 const REVENUECAT_KEYS = {
-  ios: 'test_hIJbAShTPWrgmyNMOpbjcxvBwwN',
-  android: 'test_hIJbAShTPWrgmyNMOpbjcxvBwwN',
+  ios: 'appl_IuXblSyhlrfDERNEqYWdkRptXRe',
+  android: 'appl_IuXblSyhlrfDERNEqYWdkRptXRe',
 };
 
 let isConfigured = false;
