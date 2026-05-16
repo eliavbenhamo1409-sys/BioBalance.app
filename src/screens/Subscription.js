@@ -1,14 +1,27 @@
-import React, { useState } from 'react';
+// ============================================================
+// Subscription — entry screen for BioBalance Pro.
+// ============================================================
+// Mostly an explanatory page. The real purchase flow is the paywall
+// configured in the RevenueCat Dashboard, presented via
+// RevenueCatUI.presentPaywall(). We currently sell only the monthly
+// plan (₪12.90); the yearly tier is intentionally hidden for now.
+
+import React, { useCallback, useState } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   ScrollView,
   TouchableOpacity,
+  ActivityIndicator,
+  Alert,
+  Platform,
+  Linking,
 } from 'react-native';
 import { SafeAreaView, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useNavigation } from '@react-navigation/native';
+import usePro from '../hooks/usePro';
 
 const GREEN = '#16A34A';
 const GREEN_DARK = '#15803D';
@@ -38,10 +51,50 @@ const BENEFITS = [
   },
 ];
 
+const MANAGE_URL_IOS = 'https://apps.apple.com/account/subscriptions';
+const MANAGE_URL_ANDROID = 'https://play.google.com/store/account/subscriptions';
+
 export default function Subscription() {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
-  const [plan, setPlan] = useState('yearly');
+  const { isPro, ready, openPaywall, restore } = usePro();
+  const [busy, setBusy] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+
+  const handlePurchase = useCallback(async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const { purchased, result } = await openPaywall();
+      if (purchased) {
+        Alert.alert('ברוך הבא ל-BioBalance Pro 💚', 'המנוי הופעל בהצלחה.');
+      } else if (result === 'ERROR') {
+        Alert.alert('שגיאה', 'לא הצלחנו להציג את המסך. נסה שוב.');
+      }
+    } finally {
+      setBusy(false);
+    }
+  }, [busy, openPaywall]);
+
+  const handleRestore = useCallback(async () => {
+    if (restoring) return;
+    setRestoring(true);
+    try {
+      const res = await restore();
+      if (res?.isPro) {
+        Alert.alert('שוחזר בהצלחה', 'המנוי הקודם שלך פעיל מחדש.');
+      } else {
+        Alert.alert('לא נמצא מנוי פעיל', 'לא הצלחנו לאתר רכישה קודמת בחשבון הזה.');
+      }
+    } finally {
+      setRestoring(false);
+    }
+  }, [restoring, restore]);
+
+  const handleManage = useCallback(async () => {
+    const url = Platform.OS === 'android' ? MANAGE_URL_ANDROID : MANAGE_URL_IOS;
+    try { await Linking.openURL(url); } catch (_) {}
+  }, []);
 
   return (
     <SafeAreaView style={styles.container} edges={['top']}>
@@ -71,6 +124,21 @@ export default function Subscription() {
           </Text>
         </LinearGradient>
 
+        {isPro ? (
+          <View style={styles.activeCard}>
+            <View style={styles.activeBadge}>
+              <Text style={styles.activeBadgeText}>פעיל</Text>
+            </View>
+            <Text style={styles.activeTitle}>המנוי שלך פעיל</Text>
+            <Text style={styles.activeDesc}>
+              גישה מלאה לכל התכונות של BioBalance Pro. תודה שאתה איתנו.
+            </Text>
+            <TouchableOpacity style={styles.manageBtn} onPress={handleManage} activeOpacity={0.85}>
+              <Text style={styles.manageBtnText}>ניהול המנוי בחנות</Text>
+            </TouchableOpacity>
+          </View>
+        ) : null}
+
         <View style={styles.benefitsSection}>
           <Text style={styles.sectionLabel}>מה כלול</Text>
           <View style={styles.benefitsCard}>
@@ -91,46 +159,29 @@ export default function Subscription() {
           </View>
         </View>
 
-        <Text style={styles.sectionLabel}>בחר מנוי</Text>
-        <Text style={styles.planHint}>המחיר הסופי יוצג בשלב התשלום המאובטח.</Text>
-
-        <TouchableOpacity
-          style={[styles.planCard, plan === 'monthly' && styles.planCardActive]}
-          onPress={() => setPlan('monthly')}
-          activeOpacity={0.85}
-        >
-          <View style={styles.planRadioOuter}>{plan === 'monthly' ? <View style={styles.planRadioInner} /> : null}</View>
-          <View style={styles.planBody}>
-            <Text style={styles.planName}>חודשי</Text>
-            <Text style={styles.planId}>monthly · גמישות מקסימלית</Text>
-          </View>
-          <Text style={styles.planPrice}>—</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[styles.planYearlyWrap, plan === 'yearly' && styles.planCardActive]}
-          onPress={() => setPlan('yearly')}
-          activeOpacity={0.85}
-        >
-          <View style={styles.saveBadge}>
-            <Text style={styles.saveBadgeText}>הכי משתלם</Text>
-          </View>
-          <View style={styles.planCardInnerRow}>
-            <View style={styles.planRadioOuter}>{plan === 'yearly' ? <View style={styles.planRadioInner} /> : null}</View>
-            <View style={styles.planBody}>
-              <Text style={styles.planName}>שנתי</Text>
-              <Text style={styles.planId}>yearly · התחייבות ארוכת טווח</Text>
+        {!isPro ? (
+          <View style={styles.planSection}>
+            <Text style={styles.sectionLabel}>המנוי</Text>
+            <View style={styles.planCard}>
+              <View style={styles.planBody}>
+                <Text style={styles.planName}>חודשי</Text>
+                <Text style={styles.planDesc}>גמישות מלאה — ביטול בכל רגע</Text>
+              </View>
+              <View style={styles.priceWrap}>
+                <Text style={styles.priceCurrency}>₪</Text>
+                <Text style={styles.price}>12.90</Text>
+                <Text style={styles.pricePeriod}>/חודש</Text>
+              </View>
             </View>
-            <Text style={styles.planPrice}>—</Text>
           </View>
-        </TouchableOpacity>
+        ) : null}
 
         <Text style={styles.legal}>
-          המנוי מתחדש אוטומטית אלא אם בוטל לפחות 24 שעות לפני תום התקופה. ניתן לנהל
-          ולבטל את המנוי בהגדרות החשבון.
+          המנוי מתחדש אוטומטית אלא אם בוטל לפחות 24 שעות לפני תום התקופה.
+          ניתן לנהל ולבטל את המנוי בכל עת דרך הגדרות החשבון בחנות האפליקציות.
         </Text>
 
-        <View style={{ height: 120 }} />
+        <View style={{ height: 140 }} />
       </ScrollView>
 
       <View
@@ -139,10 +190,46 @@ export default function Subscription() {
           { paddingBottom: Math.max(14, insets.bottom) },
         ]}
       >
-        <TouchableOpacity style={styles.cta} activeOpacity={0.88}>
-          <Text style={styles.ctaText}>המשך לתשלום המאובטח</Text>
-          <Text style={styles.ctaSub}>גישה מלאה לכל התכונות של BioBalance Pro</Text>
-        </TouchableOpacity>
+        {!isPro ? (
+          <>
+            <TouchableOpacity
+              style={[styles.cta, (!ready || busy) && styles.ctaDisabled]}
+              activeOpacity={0.88}
+              onPress={handlePurchase}
+              disabled={!ready || busy}
+            >
+              {busy ? (
+                <ActivityIndicator color="#FFFFFF" />
+              ) : (
+                <>
+                  <Text style={styles.ctaText}>המשך לתשלום המאובטח</Text>
+                  <Text style={styles.ctaSub}>גישה מלאה לכל התכונות של BioBalance Pro</Text>
+                </>
+              )}
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={handleRestore}
+              style={styles.restoreBtn}
+              activeOpacity={0.7}
+              disabled={restoring}
+            >
+              {restoring ? (
+                <ActivityIndicator size="small" color={GREEN_DARK} />
+              ) : (
+                <Text style={styles.restoreText}>שחזור רכישות</Text>
+              )}
+            </TouchableOpacity>
+          </>
+        ) : (
+          <TouchableOpacity
+            style={styles.ctaSecondary}
+            activeOpacity={0.85}
+            onPress={() => navigation.goBack()}
+          >
+            <Text style={styles.ctaSecondaryText}>חזרה לאפליקציה</Text>
+          </TouchableOpacity>
+        )}
       </View>
     </SafeAreaView>
   );
@@ -221,8 +308,59 @@ const styles = StyleSheet.create({
     textAlign: 'right',
     fontWeight: '400',
   },
-  benefitsSection: {
+
+  activeCard: {
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: GREEN_LINE,
+    backgroundColor: GREEN_SOFT,
+    padding: 18,
+    marginBottom: 20,
+  },
+  activeBadge: {
+    alignSelf: 'flex-end',
+    backgroundColor: GREEN,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 100,
     marginBottom: 8,
+  },
+  activeBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#FFFFFF',
+    letterSpacing: 0.3,
+  },
+  activeTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+    color: GREEN_DARK,
+    textAlign: 'right',
+    marginBottom: 6,
+  },
+  activeDesc: {
+    fontSize: 13,
+    color: '#475569',
+    textAlign: 'right',
+    lineHeight: 20,
+    marginBottom: 12,
+  },
+  manageBtn: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: GREEN_LINE,
+    borderRadius: 12,
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  manageBtnText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: GREEN_DARK,
+  },
+
+  benefitsSection: {
+    marginBottom: 20,
   },
   sectionLabel: {
     fontSize: 13,
@@ -282,13 +420,8 @@ const styles = StyleSheet.create({
     color: '#6B7280',
     textAlign: 'right',
   },
-  planHint: {
-    fontSize: 13,
-    color: '#94A3B8',
-    textAlign: 'right',
-    marginBottom: 14,
-    lineHeight: 20,
-  },
+
+  planSection: { marginBottom: 8 },
   planCard: {
     flexDirection: 'row-reverse',
     alignItems: 'center',
@@ -296,91 +429,54 @@ const styles = StyleSheet.create({
     paddingHorizontal: 18,
     borderRadius: 18,
     borderWidth: 1.5,
-    borderColor: '#E5E7EB',
-    backgroundColor: '#FAFAFA',
-    marginBottom: 12,
-  },
-  planYearlyWrap: {
-    borderRadius: 18,
-    borderWidth: 1.5,
-    borderColor: GREEN_LINE,
-    backgroundColor: GREEN_SOFT,
-    paddingTop: 22,
-    paddingBottom: 18,
-    paddingHorizontal: 18,
-    marginBottom: 12,
-    position: 'relative',
-    overflow: 'visible',
-  },
-  planCardInnerRow: {
-    flexDirection: 'row-reverse',
-    alignItems: 'center',
-  },
-  planCardActive: {
     borderColor: GREEN,
     backgroundColor: '#FFFFFF',
     shadowColor: GREEN,
     shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.12,
+    shadowOpacity: 0.10,
     shadowRadius: 12,
     elevation: 3,
   },
-  saveBadge: {
-    position: 'absolute',
-    top: -10,
-    right: 18,
-    backgroundColor: GREEN,
-    paddingHorizontal: 12,
-    paddingVertical: 4,
-    borderRadius: 100,
-  },
-  saveBadgeText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: '#FFFFFF',
-    letterSpacing: 0.3,
-  },
-  planRadioOuter: {
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    borderWidth: 2,
-    borderColor: '#CBD5E1',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginLeft: 14,
-  },
-  planRadioInner: {
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    backgroundColor: GREEN,
-  },
-  planBody: {
-    flex: 1,
-  },
+  planBody: { flex: 1 },
   planName: {
     fontSize: 17,
     fontWeight: '700',
     color: '#0F172A',
     textAlign: 'right',
   },
-  planId: {
+  planDesc: {
     fontSize: 12,
     color: '#64748B',
     marginTop: 4,
     textAlign: 'right',
   },
-  planPrice: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#94A3B8',
+  priceWrap: {
+    flexDirection: 'row-reverse',
+    alignItems: 'baseline',
   },
+  priceCurrency: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: GREEN_DARK,
+    marginLeft: 2,
+  },
+  price: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: GREEN_DARK,
+    letterSpacing: -0.5,
+  },
+  pricePeriod: {
+    fontSize: 12,
+    color: '#64748B',
+    marginRight: 4,
+  },
+
   legal: {
     marginTop: 20,
     fontSize: 11,
     lineHeight: 17,
-    color: '#CBD5E1',
+    color: '#94A3B8',
     textAlign: 'right',
   },
   footer: {
@@ -402,6 +498,7 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     elevation: 4,
   },
+  ctaDisabled: { opacity: 0.55 },
   ctaText: {
     fontSize: 17,
     fontWeight: '700',
@@ -413,5 +510,28 @@ const styles = StyleSheet.create({
     fontSize: 11,
     color: 'rgba(255,255,255,0.85)',
     fontWeight: '500',
+  },
+  ctaSecondary: {
+    backgroundColor: GREEN_SOFT,
+    borderWidth: 1,
+    borderColor: GREEN_LINE,
+    borderRadius: 16,
+    paddingVertical: 16,
+    alignItems: 'center',
+  },
+  ctaSecondaryText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: GREEN_DARK,
+  },
+  restoreBtn: {
+    marginTop: 10,
+    paddingVertical: 10,
+    alignItems: 'center',
+  },
+  restoreText: {
+    fontSize: 13,
+    color: '#64748B',
+    fontWeight: '600',
   },
 });

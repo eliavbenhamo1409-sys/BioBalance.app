@@ -21,6 +21,11 @@ import * as Notifications from 'expo-notifications';
 import useNotifications from './src/hooks/useNotifications';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import { supabase } from './src/api/supabaseClient';
+import {
+  configurePurchases,
+  loginToPurchases,
+  logoutFromPurchases,
+} from './src/api/purchasesClient';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -156,17 +161,24 @@ export default function App() {
       console.log('[App] Initializing...');
     }
 
+    // RevenueCat must be configured once before any other Purchases call.
+    // Login binds happens later when we have a Supabase user id.
+    configurePurchases();
+
     const { data: { subscription } } = supabase.auth.onAuthStateChange((event, newSession) => {
       if (__DEV__ && event !== 'TOKEN_REFRESHED') {
         console.log('[App] Auth event:', event, newSession?.user?.email || 'no user');
       }
       authResolvedRef.current = true;
 
+      const uid = newSession?.user?.id;
+
       switch (event) {
         case 'INITIAL_SESSION':
           if (newSession) {
             setSession(newSession);
             setAuthState('authenticated');
+            if (uid) loginToPurchases(uid);
           } else {
             setAuthState('unauthenticated');
           }
@@ -174,21 +186,25 @@ export default function App() {
         case 'SIGNED_IN':
           setSession(newSession);
           setAuthState('authenticated');
+          if (uid) loginToPurchases(uid);
           break;
         case 'TOKEN_REFRESHED':
           if (newSession) {
             setSession(newSession);
             setAuthState('authenticated');
+            if (uid) loginToPurchases(uid);
           }
           break;
         case 'SIGNED_OUT':
           setSession(null);
           setAuthState('unauthenticated');
+          logoutFromPurchases();
           break;
         default:
           if (newSession) {
             setSession(newSession);
             setAuthState('authenticated');
+            if (uid) loginToPurchases(uid);
           }
       }
     });

@@ -28,6 +28,7 @@ import { useApp } from '../context/AppContext';
 import { deleteAccount } from '../api/supabaseClient';
 import { calculateNutritionTargets } from '../api/aiClient';
 import SourceCitation from '../components/SourceCitation';
+import usePro from '../hooks/usePro';
 
 const normalizeActivityLevel = (level) => (level === 'high' ? 'intense' : level);
 
@@ -88,6 +89,7 @@ const AnimatedCard = ({ children, delay = 0, style }) => {
 export default function Profile() {
   const navigation = useNavigation();
   const { profile, setProfile, user, logout } = useApp();
+  const { isPro } = usePro();
 
   const userEmail = user?.email || profile?.email || 'לא מחובר';
 
@@ -414,7 +416,11 @@ export default function Profile() {
             </View>
             <View style={styles.proBannerCopy}>
               <Text style={styles.proBannerTitle}>BioBalance Pro</Text>
-              <Text style={styles.proBannerDesc}>ניתוח AI, ארוחות חכמות וסטטיסטיקות מלאות</Text>
+              <Text style={styles.proBannerDesc}>
+                {isPro
+                  ? 'המנוי שלך פעיל — תודה שאתה איתנו'
+                  : 'ניתוח AI, ארוחות חכמות וסטטיסטיקות מלאות'}
+              </Text>
             </View>
             <Text style={styles.proBannerArrow}>←</Text>
           </TouchableOpacity>
