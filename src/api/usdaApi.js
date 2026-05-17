@@ -6,6 +6,41 @@
 const USDA_API_KEY = 'idqs90mNRifq90dmbvCNpCvVPgRNn6ZgVnsyP1c2';
 const USDA_BASE_URL = 'https://api.nal.usda.gov/fdc/v1';
 
+// Foundation/SR Legacy are the curated tables (best macro accuracy).
+// Survey (FNDDS) is broader and used as a fallback when curated tables miss.
+const USDA_DATA_TYPES_PRIMARY = ['Foundation', 'SR Legacy'];
+const USDA_DATA_TYPES_FALLBACK = ['Survey (FNDDS)'];
+
+const buildSearchUrl = (query, pageSize, dataTypes) => {
+  const params = new URLSearchParams();
+  params.set('api_key', USDA_API_KEY);
+  params.set('query', String(query ?? ''));
+  params.set('pageSize', String(pageSize));
+  // Comma-joined per USDA spec; URLSearchParams handles whitespace/quoting.
+  params.set('dataType', dataTypes.join(','));
+  return `${USDA_BASE_URL}/foods/search?${params.toString()}`;
+};
+
+const fetchUsdaJson = async (url) => {
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  });
+  if (!response.ok) {
+    let body = '';
+    try {
+      body = (await response.text()).slice(0, 240);
+    } catch (_) {}
+    const err = new Error(
+      `USDA API error: ${response.status}${body ? ` — ${body}` : ''}`,
+    );
+    err.status = response.status;
+    err.body = body;
+    throw err;
+  }
+  return response.json();
+};
+
 const KJ_PER_KCAL = 4.184;
 
 // FDC nutrient ids (common)
@@ -192,34 +227,61 @@ const rankUsdARawFoods = (rawFoods, query) => {
   }).sort((a, b) => b.score - a.score);
 };
 
+const searchUsdaRaw = async (query, pageSize) => {
+  const sz = pageSize == null ? 20 : Math.max(8, Math.min(25, pageSize));
+  const trimmed = String(query ?? '').trim();
+  if (!trimmed) return [];
+
+  const tryDataTypes = async (dataTypes) => {
+    const url = buildSearchUrl(trimmed, sz, dataTypes);
+    const data = await fetchUsdaJson(url);
+    return Array.isArray(data?.foods) ? data.foods : [];
+  };
+
+  let primary = [];
+  try {
+    primary = await tryDataTypes(USDA_DATA_TYPES_PRIMARY);
+  } catch (error) {
+    if (__DEV__) {
+      const status = error?.status ?? '?';
+      console.warn(
+        `[USDA] primary search failed (${status}) for "${trimmed}": ${
+          error?.body || error?.message
+        }`,
+      );
+    }
+    primary = [];
+  }
+  if (primary.length > 0) return primary;
+
+  try {
+    return await tryDataTypes(USDA_DATA_TYPES_FALLBACK);
+  } catch (error) {
+    if (__DEV__) {
+      const status = error?.status ?? '?';
+      console.warn(
+        `[USDA] FNDDS fallback failed (${status}) for "${trimmed}": ${
+          error?.body || error?.message
+        }`,
+      );
+    }
+    return [];
+  }
+};
+
 // ============================================================
 // Search for foods by name
 // ============================================================
 export const searchFood = async (query, pageSize = 20) => {
   try {
-    const sz = pageSize == null ? 20 : Math.max(8, Math.min(25, pageSize));
-    const response = await fetch(
-      `${USDA_BASE_URL}/foods/search?api_key=${USDA_API_KEY}&query=${encodeURIComponent(query)}&pageSize=${sz}&dataType=Foundation,SR Legacy`,
-      {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(`USDA API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const rawFoods = data.foods || [];
+    const rawFoods = await searchUsdaRaw(query, pageSize);
+    if (!rawFoods.length) return [];
     const ranked = rankUsdARawFoods(rawFoods, query);
     const orderedRaw = ranked.map((r) => r.food);
     return orderedRaw.map((food) => parseSingleFood(food)).filter((f) => f !== null);
   } catch (error) {
-    console.error('USDA search error:', error);
-    return null;
+    console.error('USDA search error:', error?.message || error);
+    return [];
   }
 };
 
@@ -228,23 +290,8 @@ export const searchFood = async (query, pageSize = 20) => {
  */
 export const searchFoodWithScores = async (query, pageSize = 20) => {
   try {
-    const sz = pageSize == null ? 20 : Math.max(8, Math.min(25, pageSize));
-    const response = await fetch(
-      `${USDA_BASE_URL}/foods/search?api_key=${USDA_API_KEY}&query=${encodeURIComponent(query)}&pageSize=${sz}&dataType=Foundation,SR Legacy`,
-      {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(`USDA API error: ${response.status}`);
-    }
-
-    const data = await response.json();
-    const rawFoods = data.foods || [];
+    const rawFoods = await searchUsdaRaw(query, pageSize);
+    if (!rawFoods.length) return [];
     const ranked = rankUsdARawFoods(rawFoods, query);
     const out = [];
     for (const { food, score } of ranked) {
@@ -257,7 +304,7 @@ export const searchFoodWithScores = async (query, pageSize = 20) => {
     }
     return out;
   } catch (error) {
-    console.error('USDA search (scored) error:', error);
+    console.error('USDA search (scored) error:', error?.message || error);
     return [];
   }
 };
@@ -267,24 +314,12 @@ export const searchFoodWithScores = async (query, pageSize = 20) => {
 // ============================================================
 export const getFoodById = async (fdcId) => {
   try {
-    const response = await fetch(
+    const data = await fetchUsdaJson(
       `${USDA_BASE_URL}/food/${fdcId}?api_key=${USDA_API_KEY}`,
-      {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      }
     );
-
-    if (!response.ok) {
-      throw new Error(`USDA API error: ${response.status}`);
-    }
-
-    const data = await response.json();
     return parseSingleFood(data);
   } catch (error) {
-    console.error('USDA get food error:', error);
+    console.error('USDA get food error:', error?.message || error);
     return null;
   }
 };

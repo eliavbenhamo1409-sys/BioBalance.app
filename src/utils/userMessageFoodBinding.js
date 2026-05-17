@@ -31,13 +31,30 @@ export function assignGramsGreedilyByProximity(userText, foodNames) {
   const text = String(userText ?? '');
   const lower = text.toLowerCase();
   const quantities = [];
-  const re = /(\d+(?:\.\d+)?)\s*(?:גרם|גר׳)/gi;
+  // Accept gram suffixes and unit-less numbers that look like a portion
+  // ("חזה עוף 200" with implicit gram). The model already gates intent so
+  // a number near a food name is overwhelmingly a portion in this app.
+  const reGrams = /(\d+(?:\.\d+)?)\s*(?:גרם|גר׳|g\b|gr\b)/gi;
   let m;
-  while ((m = re.exec(text)) !== null) {
-    const raw = m[1];
+  while ((m = reGrams.exec(text)) !== null) {
     quantities.push({
-      grams: Math.max(1, Math.round(parseFloat(raw))),
+      grams: Math.max(1, Math.round(parseFloat(m[1]))),
       pos: m.index,
+      explicit: true,
+    });
+  }
+  // Also pick up bare numbers that aren't part of a gram pattern: this
+  // catches "סטייק 200 וגבינה צהובה" where the gram suffix was dropped.
+  const reBareNumber = /(?:^|\s|[,(])(\d{2,4})(?=\s|$|[,.)])/g;
+  while ((m = reBareNumber.exec(text)) !== null) {
+    const value = Number(m[1]);
+    if (!Number.isFinite(value) || value < 5 || value > 2000) continue;
+    const pos = m.index + (m[0].length - m[1].length);
+    if (quantities.some((q) => Math.abs(q.pos - pos) < 6)) continue;
+    quantities.push({
+      grams: Math.round(value),
+      pos,
+      explicit: false,
     });
   }
 
@@ -48,7 +65,23 @@ export function assignGramsGreedilyByProximity(userText, foodNames) {
 
   const map = new Map();
   const usedQtyIdx = new Set();
-  const THRESHOLD = 95;
+  // Distance threshold tuned to typical Hebrew sentence length around one
+  // food noun ("X גרם של Y", "Y בערך X גרם"). Generous enough to handle
+  // verb fillers without leaking across an explicit clause boundary ("ו"/",").
+  const THRESHOLD_EXPLICIT = 140;
+  const THRESHOLD_BARE = 80;
+
+  const clauseBoundaries = [];
+  const reBoundary = /(\sו|,|\bוגם\b|\bו-)/g;
+  while ((m = reBoundary.exec(text)) !== null) {
+    clauseBoundaries.push(m.index);
+  }
+
+  const isCrossingBoundary = (a, b) => {
+    const lo = Math.min(a, b);
+    const hi = Math.max(a, b);
+    return clauseBoundaries.some((bIdx) => bIdx > lo && bIdx < hi);
+  };
 
   const sortedFoods = foods.filter((f) => f.pos !== -1).sort((a, b) => a.pos - b.pos);
 
@@ -57,14 +90,18 @@ export function assignGramsGreedilyByProximity(userText, foodNames) {
     let bestD = Infinity;
     for (let i = 0; i < quantities.length; i++) {
       if (usedQtyIdx.has(i)) continue;
+      if (isCrossingBoundary(quantities[i].pos, f.pos)) continue;
       const d = Math.abs(quantities[i].pos - f.pos);
       if (d < bestD) {
         bestD = d;
         bestIdx = i;
       }
     }
-    if (bestIdx !== -1 && bestD <= THRESHOLD) {
-      map.set(f.name, quantities[bestIdx].grams);
+    if (bestIdx === -1) continue;
+    const q = quantities[bestIdx];
+    const limit = q.explicit ? THRESHOLD_EXPLICIT : THRESHOLD_BARE;
+    if (bestD <= limit) {
+      map.set(f.name, q.grams);
       usedQtyIdx.add(bestIdx);
     }
   }

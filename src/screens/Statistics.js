@@ -293,19 +293,19 @@ export default function Statistics({ embedded = false }) {
 
       <View style={styles.insightsRow}>
         <InsightChip
-          emoji="🎯"
+          emoji="🏆"
           value={`${summary.daysHitGoal}/${summary.totalDays}`}
-          label="ימים ביעד"
+          label="ימי הצלחה"
         />
         <InsightChip
           emoji="⭐"
           value={summary.best ? `${summary.best.overall}%` : '—'}
-          label={summary.best ? `שיא • ${summary.best.dateLabel}` : 'שיא היום עוד מחכה'}
+          label={summary.best ? `היום הכי טוב` : 'עוד אין שיא'}
         />
         <InsightChip
-          emoji="📅"
+          emoji="📝"
           value={summary.recordedDays}
-          label="ימים נרשמו"
+          label="ימי תיעוד"
         />
       </View>
 
@@ -476,7 +476,7 @@ function HeroScoreCard({ score, streak, periodLabel, daysHit, recorded, totalDay
         <Text style={styles.heroEyebrow}>ממוצע ה{periodLabel}</Text>
         <Text style={styles.heroScore}>{score}%</Text>
         <Text style={styles.heroSub}>
-          {daysHit}/{totalDays} ימים ביעד
+          {daysHit}/{totalDays} ימי הצלחה
         </Text>
         <View style={styles.heroBadgeRow}>
           <View style={styles.heroBadge}>
@@ -724,9 +724,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   periodPillActive: {
-    backgroundColor: '#0F172A',
+    backgroundColor: '#16A34A',
+    shadowColor: '#16A34A',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 6,
+    elevation: 2,
   },
-  periodPillText: { fontSize: 12, fontWeight: '600', color: '#6B7280' },
+  periodPillText: { fontSize: 13, fontWeight: '700', color: '#475569' },
   periodPillTextActive: { color: '#FFFFFF' },
 
   hero: {

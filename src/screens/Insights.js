@@ -7,13 +7,7 @@
 // here with `params.openCheckin = true` to show the modal.
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  Pressable,
-} from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute } from '@react-navigation/native';
 import * as Haptics from 'expo-haptics';
@@ -29,8 +23,8 @@ import {
 } from '../api/insightsRepository';
 
 const TABS = [
-  { key: 'stats', label: 'סטטיסטיקות', emoji: '📊' },
-  { key: 'ai', label: 'תובנות AI', emoji: '✨' },
+  { key: 'stats', label: 'סטטיסטיקות' },
+  { key: 'ai', label: 'תובנות AI' },
 ];
 
 const BRAND = '#16A34A';
@@ -118,28 +112,24 @@ export default function Insights() {
         <View style={styles.headerSpacer} />
       </View>
 
-      {/* Tab pill — the "lחיצה למעלה" the user asked for */}
+      {/* Same segmented control as Statistics (week / month / quarter). */}
       <View style={styles.tabsWrap}>
-        <View style={styles.tabsTrack}>
-          <View
-            style={[
-              styles.tabsIndicator,
-              tab === 'ai' ? styles.tabsIndicatorRight : styles.tabsIndicatorLeft,
-            ]}
-          />
+        <View style={styles.periodRow}>
           {TABS.map((t) => {
             const active = tab === t.key;
             return (
-              <Pressable
+              <TouchableOpacity
                 key={t.key}
+                style={[styles.periodPill, active && styles.periodPillActive]}
                 onPress={() => handleTab(t.key)}
-                style={styles.tabBtn}
+                activeOpacity={0.85}
                 accessibilityRole="tab"
                 accessibilityState={{ selected: active }}
               >
-                <Text style={styles.tabEmoji}>{t.emoji}</Text>
-                <Text style={[styles.tabLabel, active && styles.tabLabelActive]}>{t.label}</Text>
-              </Pressable>
+                <Text style={[styles.periodPillText, active && styles.periodPillTextActive]}>
+                  {t.label}
+                </Text>
+              </TouchableOpacity>
             );
           })}
         </View>
@@ -195,50 +185,32 @@ const styles = StyleSheet.create({
     paddingBottom: 6,
     backgroundColor: '#FFFFFF',
   },
-  tabsTrack: {
+  // Mirror `Statistics.js` → `periodRow` / `periodPill*` (embedded stats strip).
+  periodRow: {
     flexDirection: 'row',
-    backgroundColor: '#F1F5F9',
-    borderRadius: 14,
-    padding: 4,
-    position: 'relative',
-    height: 48,
-    overflow: 'hidden',
+    backgroundColor: '#FFFFFF',
+    borderRadius: 12,
+    padding: 3,
+    marginBottom: 4,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
   },
-  tabsIndicator: {
-    position: 'absolute',
-    top: 4,
-    bottom: 4,
-    width: '49%',
-    backgroundColor: '#0F172A',
-    borderRadius: 11,
-    shadowColor: '#0F172A',
+  periodPill: {
+    flex: 1,
+    paddingVertical: 7,
+    borderRadius: 9,
+    alignItems: 'center',
+  },
+  periodPillActive: {
+    backgroundColor: BRAND,
+    shadowColor: BRAND,
     shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.15,
+    shadowOpacity: 0.25,
     shadowRadius: 6,
     elevation: 2,
   },
-  // RTL hint: "right" tab on screen is the first in row, so left/right
-  // positions are flipped vs. LTR — but RN's row-reverse on this layout
-  // is implicit because the language is RTL. We treat tab[0]=stats=right,
-  // tab[1]=ai=left.
-  tabsIndicatorRight: { right: '50%', left: 4 },
-  tabsIndicatorLeft: { left: '50%', right: 4 },
-
-  tabBtn: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 6,
-    zIndex: 1,
-  },
-  tabEmoji: { fontSize: 14 },
-  tabLabel: {
-    fontSize: 13,
-    fontWeight: '600',
-    color: '#6B7280',
-  },
-  tabLabelActive: { color: '#FFFFFF' },
+  periodPillText: { fontSize: 13, fontWeight: '700', color: '#475569' },
+  periodPillTextActive: { color: '#FFFFFF' },
 
   body: { flex: 1, backgroundColor: '#FFFFFF' },
 });

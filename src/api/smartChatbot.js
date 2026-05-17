@@ -196,6 +196,10 @@ export const processUserMessage = async (userMessage, context) => {
     // Deterministic USDA + validation: model extracts name + quantity + unit (or legacy grams) — no LLM kcal for add_food
     if (result.action?.type === 'add_food' && result.action.data?.foods?.length) {
       try {
+        const geminiResponseBackup =
+          typeof result.response === 'string' && result.response.trim()
+            ? result.response.trim()
+            : '';
         const enriched = await enrichAddFoodFoods(result.action.data.foods, { signal });
         result.action.data.foods = enriched.resolvedFoods;
         result.action.data.needsClarification = enriched.needsClarification;
@@ -211,17 +215,39 @@ export const processUserMessage = async (userMessage, context) => {
           delete result.action.data.meal_group_id;
           delete result.action.data.source_message_text;
         }
-        let replyBody = formatFoodLoggedReply(enriched.resolvedFoods, {
-          dailyStats: context.dailyStats,
-          targets: context.targets,
-          needsClarification: enriched.needsClarification,
-          skippedOverCap: enriched.skippedOverCap,
-          estimateFallbackCount: enriched.estimateFallbackCount ?? 0,
-        });
-        if (wg > 0) {
-          replyBody += `\n💧 ${wg} כוסות מים`;
+        if (hasSaved) {
+          let replyBody = formatFoodLoggedReply(enriched.resolvedFoods, {
+            dailyStats: context.dailyStats,
+            targets: context.targets,
+            needsClarification: enriched.needsClarification,
+            skippedOverCap: enriched.skippedOverCap,
+            estimateFallbackCount: enriched.estimateFallbackCount ?? 0,
+          });
+          if (wg > 0) {
+            replyBody += `\n💧 ${wg} כוסות מים`;
+          }
+          result.response = replyBody;
+        } else if (geminiResponseBackup) {
+          // Nothing resolved deterministically, but the model already produced
+          // a helpful response. Preserve it so the user doesn't see a hard
+          // "needs clarification" wall on every niche food. Still strip the
+          // add_food action so the meal isn't silently logged with bad data.
+          result.action = null;
+          result.response = geminiResponseBackup;
+        } else {
+          // No model response either → keep the clarification UX as last resort.
+          let replyBody = formatFoodLoggedReply(enriched.resolvedFoods, {
+            dailyStats: context.dailyStats,
+            targets: context.targets,
+            needsClarification: enriched.needsClarification,
+            skippedOverCap: enriched.skippedOverCap,
+            estimateFallbackCount: enriched.estimateFallbackCount ?? 0,
+          });
+          if (wg > 0) {
+            replyBody += `\n💧 ${wg} כוסות מים`;
+          }
+          result.response = replyBody;
         }
-        result.response = replyBody;
       } catch (e) {
         if (e?.code === 'USER_CANCEL') throw e;
         devLog('enrichAddFoodFoods:', e.message);

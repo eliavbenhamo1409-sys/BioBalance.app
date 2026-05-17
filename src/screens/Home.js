@@ -199,6 +199,12 @@ function portionPendingOverlapsIncoming(pendingFoods, resolvedFoodRows) {
 export default function Home() {
   const navigation = useNavigation();
   const scrollViewRef = useRef(null);
+  // Tracks how close the user is to the chat's bottom edge. We refuse to
+  // auto-scroll on new messages when the user has scrolled up — otherwise
+  // they get yanked back down while reading older messages.
+  const isNearBottomRef = useRef(true);
+  const chatLayoutHeightRef = useRef(0);
+  const chatContentHeightRef = useRef(0);
   const { profile, dailyStats, setDailyStats, messages, addMessage, setMessages, clearMessages, today, isLoading, addWater: contextAddWater, hasCompletedOnboarding, user, addMeal } = useApp();
   // Inactivity-nudge wiring: every meal log calls `updateLastFoodLog`,
   // which also re-arms the 3.5h schedule.
@@ -418,10 +424,16 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    // Only scroll to end on new messages - NOT on every typing tick
-    if (messages.length > 0) {
-      setTimeout(() => scrollViewRef.current?.scrollToEnd({ animated: true }), 100);
-    }
+    // Only scroll to end on new messages - NOT on every typing tick.
+    // And only when the user is already near the bottom: if they scrolled
+    // up to read history, don't yank them back down.
+    if (messages.length === 0) return;
+    if (!isNearBottomRef.current) return;
+    const id = setTimeout(
+      () => scrollViewRef.current?.scrollToEnd({ animated: true }),
+      100,
+    );
+    return () => clearTimeout(id);
   }, [messages.length]); // Track length instead of array reference to be safer
 
   // Keyboard listeners
@@ -568,9 +580,19 @@ export default function Home() {
   }, [isHeaderCollapsed, collapseHeader]);
 
   const handleScroll = useCallback((event) => {
-    const offsetY = event.nativeEvent.contentOffset.y;
+    const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+    const offsetY = contentOffset.y;
     if (offsetY > 60 && !isHeaderCollapsed) {
       collapseHeader();
+    }
+    if (contentSize && layoutMeasurement) {
+      chatContentHeightRef.current = contentSize.height;
+      chatLayoutHeightRef.current = layoutMeasurement.height;
+      const distanceFromBottom =
+        contentSize.height - layoutMeasurement.height - offsetY;
+      // "Near bottom" = within ~80px of the latest message. Generous enough
+      // to survive a single tall message expanding underneath the user.
+      isNearBottomRef.current = distanceFromBottom <= 80;
     }
   }, [isHeaderCollapsed, collapseHeader]);
 
@@ -1291,7 +1313,14 @@ export default function Home() {
 
       // Call smart chatbot
       const result = await processUserMessage(userText, context);
-      setIsTyping(false);
+      // NOTE: do NOT turn off the typing indicator here.
+      // For portion_confirm / ask_quantity flows, handleSmartBotAction still
+      // has work to do (e.g. `prefillAskQuantityHints` USDA lookups) before
+      // the confirm card is rendered. Killing the dots here creates a
+      // visible "silent gap" between the dots and the card. The dots are
+      // turned off either by `addBotMessage` (which manages its own
+      // indicator) or right before each portion-confirm `addMessage`, and
+      // the `finally` block below acts as a safety net.
 
       devLog('🤖 Smart Bot Result:', result.intent, result.action?.type);
 
@@ -1348,6 +1377,11 @@ export default function Home() {
       isProcessingRef.current = false;
       chatGenAbortRef.current = null;
       setChatGenAbortable(false);
+      // Safety net: ensure the typing indicator never gets stuck on if a
+      // code path forgot to clear it. Per-message clears above still run
+      // synchronously together with `addMessage`, so the card replaces the
+      // dots in a single React render.
+      setIsTyping(false);
     }
   };
 
@@ -1408,6 +1442,8 @@ export default function Home() {
             setPendingFoods(action.data.items);
             const intro = buildPortionConfirmIntro(action.data.items);
             const uniqueId = `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+            // Swap the typing dots for the confirm card in a single render.
+            setIsTyping(false);
             addMessage({
               text: intro,
               isBot: true,
@@ -1438,11 +1474,14 @@ export default function Home() {
           }
           if (action.data?.foods?.length > 0) {
             try {
+              // Keep the typing dots visible during this lookup. Killing them
+              // earlier creates a visible silent gap before the card.
               const hinted = await prefillAskQuantityHints(action.data.foods);
               const withGuesses = attachPortionGuesses(hinted);
               setPendingFoods(withGuesses);
               const intro = buildPortionConfirmIntro(withGuesses);
               const uniqueId = `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+              setIsTyping(false);
               addMessage({
                 text: intro,
                 isBot: true,
@@ -1455,6 +1494,7 @@ export default function Home() {
               const fallback = attachPortionGuesses(action.data.foods);
               setPendingFoods(fallback);
               const intro = buildPortionConfirmIntro(fallback);
+              setIsTyping(false);
               addMessage({
                 text: intro,
                 isBot: true,

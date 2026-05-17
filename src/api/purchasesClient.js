@@ -22,9 +22,15 @@ import RevenueCatUI, { PAYWALL_RESULT } from 'react-native-purchases-ui';
  * `appl_...` / `goog_...` keys throw "Invalid API key" on configure. We
  * detect Expo Go up-front and bail out silently — the rest of the app keeps
  * working, just without purchases (which would be impossible there anyway).
+ *
+ * We check multiple signals because Expo's enum casing has changed across
+ * SDK versions (e.g. older releases compare against the literal 'storeClient',
+ * and `appOwnership` is the legacy fallback). Belt and braces.
  */
 const isExpoGo =
-  Constants?.executionEnvironment === ExecutionEnvironment.StoreClient;
+  Constants?.executionEnvironment === ExecutionEnvironment?.StoreClient ||
+  Constants?.executionEnvironment === 'storeClient' ||
+  Constants?.appOwnership === 'expo';
 
 // ------------------------------------------------------------
 // Configuration
@@ -49,6 +55,12 @@ const REVENUECAT_KEYS = {
 };
 
 let isConfigured = false;
+// We attempted Purchases.configure at least once. Used to short-circuit
+// repeat attempts on every Purchases method call when the first attempt
+// already failed (e.g. inside Expo Go where the SDK throws "Invalid API
+// key"). Without this flag, every loginToPurchases/safeGetCustomerInfo/
+// fetchOfferings call would re-trigger the failure and spam the log.
+let configureAttempted = false;
 let lastAppUserId = null;
 
 const TAG = '[purchases]';
@@ -81,11 +93,13 @@ const apiKeyForPlatform = () => {
 };
 
 /**
- * Configure Purchases. Safe to call multiple times — extra calls are no-ops.
- * Must be called once on app start before any other Purchases method.
+ * Configure Purchases. Safe to call multiple times — first attempt wins,
+ * subsequent calls are no-ops (success OR failure). Must be called once on
+ * app start before any other Purchases method.
  */
 export const configurePurchases = () => {
-  if (isConfigured) return;
+  if (isConfigured || configureAttempted) return;
+  configureAttempted = true;
   if (isExpoGo) {
     log('skipped — running inside Expo Go (use a dev/production build to test purchases).');
     return;
