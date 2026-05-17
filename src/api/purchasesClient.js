@@ -13,8 +13,18 @@
 //     "why is the paywall empty?" from a TestFlight session.
 
 import { Platform } from 'react-native';
+import Constants, { ExecutionEnvironment } from 'expo-constants';
 import Purchases, { LOG_LEVEL } from 'react-native-purchases';
 import RevenueCatUI, { PAYWALL_RESULT } from 'react-native-purchases-ui';
+
+/**
+ * Expo Go ships without native StoreKit / BillingClient, so the production
+ * `appl_...` / `goog_...` keys throw "Invalid API key" on configure. We
+ * detect Expo Go up-front and bail out silently — the rest of the app keeps
+ * working, just without purchases (which would be impossible there anyway).
+ */
+const isExpoGo =
+  Constants?.executionEnvironment === ExecutionEnvironment.StoreClient;
 
 // ------------------------------------------------------------
 // Configuration
@@ -76,6 +86,10 @@ const apiKeyForPlatform = () => {
  */
 export const configurePurchases = () => {
   if (isConfigured) return;
+  if (isExpoGo) {
+    log('skipped — running inside Expo Go (use a dev/production build to test purchases).');
+    return;
+  }
   const apiKey = apiKeyForPlatform();
   if (!apiKey) {
     warn('no api key for platform, skipping', Platform.OS);
@@ -104,6 +118,7 @@ export const configurePurchases = () => {
  */
 export const loginToPurchases = async (userId) => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) return null; // Expo Go
   if (!userId) return null;
   if (lastAppUserId === userId) {
     log('logIn skipped — already bound to', userId);
@@ -122,7 +137,7 @@ export const loginToPurchases = async (userId) => {
 
 /** Sign out of RevenueCat (call on Supabase sign-out). */
 export const logoutFromPurchases = async () => {
-  if (!isConfigured) return;
+  if (!isConfigured) return; // also covers Expo Go
   try {
     await Purchases.logOut();
     lastAppUserId = null;
@@ -135,6 +150,7 @@ export const logoutFromPurchases = async () => {
 /** Returns customerInfo or null on any failure. Never throws. */
 export const safeGetCustomerInfo = async () => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) return null; // Expo Go
   try {
     const info = await Purchases.getCustomerInfo();
     log('getCustomerInfo', summarizeCustomerInfo(info));
@@ -158,6 +174,7 @@ export const customerInfoHasPro = (customerInfo) => {
  */
 export const onCustomerInfoChanged = (handler) => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) return () => {}; // Expo Go
   try {
     const wrapped = (info) => {
       log('customerInfoUpdate', summarizeCustomerInfo(info));
@@ -193,6 +210,16 @@ export const onCustomerInfoChanged = (handler) => {
  */
 export const fetchOfferings = async () => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) {
+    return {
+      ok: false,
+      currentOffering: null,
+      monthlyPackage: null,
+      monthlyPriceString: null,
+      monthlyProductId: null,
+      error: 'EXPO_GO_OR_NOT_CONFIGURED',
+    };
+  }
   try {
     const offerings = await Purchases.getOfferings();
     const all = offerings?.all || {};
@@ -304,6 +331,9 @@ const labelPaywallResult = (result) => {
  */
 export const presentPaywallSheet = async () => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) {
+    return { purchased: false, result: 'EXPO_GO', customerInfo: null };
+  }
   log('presentPaywall: opening sheet (uses Current Offering)');
   try {
     const result = await RevenueCatUI.presentPaywall();
@@ -336,6 +366,9 @@ export const presentPaywallSheet = async () => {
  */
 export const purchaseMonthly = async () => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) {
+    return { purchased: false, result: 'EXPO_GO', customerInfo: null };
+  }
   log('purchaseMonthly: fetching package…');
   const offerings = await fetchOfferings();
   if (!offerings.ok || !offerings.monthlyPackage) {
@@ -379,6 +412,7 @@ export const purchaseMonthly = async () => {
  */
 export const presentPaywallIfNeeded = async (entitlement = PRO_ENTITLEMENT) => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) return { purchased: false, result: 'EXPO_GO' };
   try {
     const result = await RevenueCatUI.presentPaywallIfNeeded({
       requiredEntitlementIdentifier: entitlement,
@@ -399,6 +433,9 @@ export const presentPaywallIfNeeded = async (entitlement = PRO_ENTITLEMENT) => {
 /** Restore previous purchases (Apple requires a Restore action in-app). */
 export const restorePurchases = async () => {
   if (!isConfigured) configurePurchases();
+  if (!isConfigured) {
+    return { ok: false, customerInfo: null, isPro: false, error: 'EXPO_GO' };
+  }
   log('restorePurchases: starting');
   try {
     const info = await Purchases.restorePurchases();
