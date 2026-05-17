@@ -57,7 +57,15 @@ const MANAGE_URL_ANDROID = 'https://play.google.com/store/account/subscriptions'
 export default function Subscription() {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
-  const { isPro, ready, openPaywall, restore } = usePro();
+  const {
+    isPro,
+    ready,
+    offerings,
+    monthlyPriceString,
+    monthlyProductId,
+    openPaywall,
+    restore,
+  } = usePro();
   const [busy, setBusy] = useState(false);
   const [restoring, setRestoring] = useState(false);
 
@@ -168,11 +176,45 @@ export default function Subscription() {
                 <Text style={styles.planDesc}>גמישות מלאה — ביטול בכל רגע</Text>
               </View>
               <View style={styles.priceWrap}>
-                <Text style={styles.priceCurrency}>₪</Text>
-                <Text style={styles.price}>12.90</Text>
+                {monthlyPriceString ? (
+                  <Text style={styles.price}>{monthlyPriceString}</Text>
+                ) : (
+                  <>
+                    <Text style={styles.priceCurrency}>₪</Text>
+                    <Text style={styles.price}>12.90</Text>
+                  </>
+                )}
                 <Text style={styles.pricePeriod}>/חודש</Text>
               </View>
             </View>
+          </View>
+        ) : null}
+
+        {__DEV__ ? (
+          <View style={styles.debugCard}>
+            <Text style={styles.debugTitle}>Debug — RevenueCat</Text>
+            <Text style={styles.debugLine}>ready: {String(ready)}</Text>
+            <Text style={styles.debugLine}>isPro: {String(isPro)}</Text>
+            <Text style={styles.debugLine}>
+              currentOffering: {offerings?.currentOffering?.identifier || '—'}
+            </Text>
+            <Text style={styles.debugLine}>
+              packages: {offerings?.currentOffering?.availablePackages?.length ?? 0}
+            </Text>
+            <Text style={styles.debugLine}>
+              monthlyPackage: {offerings?.monthlyPackage?.identifier || '—'}
+            </Text>
+            <Text style={styles.debugLine}>
+              productId: {monthlyProductId || '—'}
+            </Text>
+            <Text style={styles.debugLine}>
+              price: {monthlyPriceString || '—'}
+            </Text>
+            {offerings?.error ? (
+              <Text style={[styles.debugLine, { color: '#B91C1C' }]}>
+                error: {offerings.error}
+              </Text>
+            ) : null}
           </View>
         ) : null}
 
@@ -533,5 +575,26 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#64748B',
     fontWeight: '600',
+  },
+  debugCard: {
+    marginTop: 18,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+  },
+  debugTitle: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#64748B',
+    marginBottom: 6,
+    letterSpacing: 0.5,
+  },
+  debugLine: {
+    fontSize: 11,
+    color: '#475569',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    lineHeight: 16,
   },
 });
