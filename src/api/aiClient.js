@@ -3,7 +3,7 @@
 // (Supabase Edge Function gemini-proxy; key stays on server).
 // ============================================================
 
-import { callGemini, GEMINI_MODEL, RateLimitError } from './geminiClient';
+import { callGemini, GEMINI_MODEL, GEMINI_VISION_MODEL, RateLimitError } from './geminiClient';
 
 /** Gemini (via Edge or direct); name is historical — not OpenAI. */
 const callLlm = async (messages, options = {}) => {
@@ -15,12 +15,11 @@ const callLlm = async (messages, options = {}) => {
 
   return await callGemini(messages, {
     model: options.model,
-    temperature: options.temperature ?? 0.3,
     maxTokens,
     responseMimeType,
     signal: options.signal,
     timeoutMs: options.timeoutMs,
-    thinkingBudget: options.thinkingBudget,
+    thinkingLevel: options.thinkingLevel,
   });
 };
 
@@ -548,6 +547,7 @@ export const estimate3DWeight = async (imagesBase64) => {
         temperature: 0.1,
         max_completion_tokens: 2000,
         response_format: { type: 'json_object' },
+        model: GEMINI_VISION_MODEL,
       },
     );
 

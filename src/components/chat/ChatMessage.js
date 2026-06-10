@@ -1,5 +1,6 @@
 import React, { memo, useEffect } from 'react';
 import { View, Text, StyleSheet, Pressable } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import Animated, {
   useSharedValue,
   useAnimatedStyle,
@@ -48,7 +49,7 @@ export function BubbleRichText({ text, isBot, isNote }) {
   );
 }
 
-function ChatMessage({ message, isBot, actionButton, brachotLayout }) {
+function ChatMessage({ message, isBot, actionButton, brachotLayout, editButton }) {
   const progress = useSharedValue(0);
 
   useEffect(() => {
@@ -137,6 +138,23 @@ function ChatMessage({ message, isBot, actionButton, brachotLayout }) {
             accessibilityLabel={actionButton.label}
           >
             <Text style={styles.actionBtnText}>{actionButton.label}</Text>
+          </Pressable>
+        ) : null}
+        {isBot && editButton?.onPress ? (
+          <Pressable
+            onPress={editButton.onPress}
+            style={({ pressed }) => [
+              styles.editPill,
+              pressed && styles.editPillPressed,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={editButton.label || 'ערוך ארוחה'}
+            hitSlop={8}
+          >
+            <Ionicons name="create-outline" size={13} color={BRAND} />
+            <Text style={styles.editPillText}>
+              {editButton.label || 'ערוך'}
+            </Text>
           </Pressable>
         ) : null}
       </View>
@@ -268,5 +286,26 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: BRAND,
     textAlign: 'center',
+  },
+  editPill: {
+    marginTop: 8,
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: '#D4EDD1',
+    backgroundColor: '#F0FDF4',
+  },
+  editPillPressed: {
+    opacity: 0.7,
+  },
+  editPillText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: BRAND,
   },
 });

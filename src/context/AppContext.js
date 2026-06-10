@@ -396,11 +396,11 @@ export const AppProvider = ({ children, session }) => {
   const addMeal = async (mealData, skipStatsUpdate = false) => {
     if (!user) {
       devLog('[AppContext] addMeal: No user, skipping');
-      return;
+      return null;
     }
 
     devLog('[AppContext] addMeal: Saving meal:', mealData.name, 'date:', today);
-    
+
     const { data: newMeal, error } = await saveMeal(user.id, {
       ...mealData,
       date: today,
@@ -409,7 +409,7 @@ export const AppProvider = ({ children, session }) => {
 
     if (error) {
       devLog('[AppContext] addMeal: Error saving meal:', error);
-      return;
+      return null;
     }
 
     devLog('[AppContext] addMeal: Saved successfully:', newMeal?.id, newMeal?.name);
@@ -424,6 +424,8 @@ export const AppProvider = ({ children, session }) => {
         });
       }
     }
+
+    return newMeal || null;
   };
 
   const removeMeal = async (mealId) => {

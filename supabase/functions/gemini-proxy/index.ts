@@ -27,7 +27,7 @@ const MAX_BODY_BYTES = 1_800_000;
 const corsHeaders: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers":
-    "authorization, x-client-info, apikey, content-type, x-app-version, x-app-build, x-request-id",
+    "authorization, x-client-info, apikey, content-type, x-app-version, x-app-build, x-app-platform, x-request-id",
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
@@ -72,6 +72,40 @@ function uuidOk(s: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
     s,
   );
+}
+
+function parseSemver(version: string): [number, number, number] {
+  const parts = String(version ?? "")
+    .trim()
+    .split(".")
+    .map((n) => parseInt(n, 10));
+  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+}
+
+/** True when installed is strictly older than minimum. */
+function isVersionOlder(installed: string, minimum: string): boolean {
+  const a = parseSemver(installed);
+  const b = parseSemver(minimum);
+  for (let i = 0; i < 3; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return false;
+}
+
+/** Chat bubble text — only fields loaded from app_version_policy (Supabase). */
+function buildUpdateRequiredChatGemini(chatResponse: string): Record<string, unknown> {
+  const text = JSON.stringify({
+    intent: "general_chat",
+    response: chatResponse,
+    action: null,
+  });
+  return {
+    candidates: [{
+      content: { parts: [{ text }] },
+      finishReason: "STOP",
+    }],
+  };
 }
 
 async function fetchGeminiUpstream(
@@ -167,6 +201,7 @@ Deno.serve(async (req) => {
   const requestId = String(payload.requestId ?? "").trim() || hdrReqId;
   const appVersion = req.headers.get("x-app-version") ?? "";
   const appBuild = req.headers.get("x-app-build") ?? "";
+  const appPlatform = (req.headers.get("x-app-platform") ?? "ios").toLowerCase();
 
   if (!uuidOk(messageId) || !uuidOk(requestId)) {
     return jsonResponse({
@@ -180,6 +215,50 @@ Deno.serve(async (req) => {
   const admin = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
   });
+
+  const { data: versionPolicy, error: versionErr } = await admin
+    .from("app_version_policy")
+    .select(
+      "min_ios_version, min_android_version, ios_store_url, android_store_url, message_he",
+    )
+    .eq("id", "default")
+    .maybeSingle();
+
+  if (!versionErr && versionPolicy) {
+    const minIos = String(versionPolicy.min_ios_version ?? "").trim();
+    const minAndroid = String(versionPolicy.min_android_version ?? "").trim();
+    const minVersion = appPlatform === "android"
+      ? (minAndroid || minIos)
+      : (minIos || minAndroid);
+    const installed = appVersion.trim() || "0.0.0";
+    const messageHe = String(versionPolicy.message_he ?? "").trim();
+    const storeUrl = appPlatform === "android"
+      ? String(versionPolicy.android_store_url ?? "").trim()
+      : String(versionPolicy.ios_store_url ?? "").trim();
+
+    if (
+      minVersion &&
+      messageHe &&
+      storeUrl &&
+      isVersionOlder(installed, minVersion)
+    ) {
+      const chatResponse = `${messageHe}\n\n${storeUrl}`;
+      console.warn(
+        `[gemini-proxy] update_required app=${installed} min=${minVersion} rid=${requestId}`,
+      );
+      return jsonResponse({
+        ok: true,
+        replay: true,
+        updateRequired: true,
+        requestId,
+        messageId,
+        minVersion,
+        storeUrl,
+        message: messageHe,
+        gemini: buildUpdateRequiredChatGemini(chatResponse),
+      }, 200);
+    }
+  }
 
   const { data: killRow, error: killErr } = await admin
     .from("ai_runtime_config")
@@ -284,7 +363,7 @@ Deno.serve(async (req) => {
   }
 
   const {
-    model = "gemini-2.5-flash",
+    model = "gemini-3.1-flash-lite",
     contents,
     generationConfig,
     safetySettings,

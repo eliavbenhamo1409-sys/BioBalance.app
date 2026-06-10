@@ -23,7 +23,7 @@ import Animated, {
   runOnJS,
 } from 'react-native-reanimated';
 import { useApp } from '../context/AppContext';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 import SourceCitation from '../components/SourceCitation';
 import moment from 'moment';
 import 'moment/locale/he';
@@ -286,13 +286,16 @@ const EditMealModal = ({ visible, meal, onClose, onSave }) => {
 
 export default function RecentMeals() {
   const navigation = useNavigation();
+  const route = useRoute();
   const { meals, removeMeal, editMeal } = useApp();
   const [todayMeals, setTodayMeals] = useState([]);
   const [editingMeal, setEditingMeal] = useState(null);
   const [showEditModal, setShowEditModal] = useState(false);
   const [isDeleteMode, setIsDeleteMode] = useState(false);
+  // Each navigation push from the chat carries its own openMealId; we track the
+  // last id we already auto-opened so re-renders don't reopen the modal.
+  const lastOpenedMealIdRef = React.useRef(null);
 
-  // Filter meals for today (considering 3AM reset)
   useEffect(() => {
     const effectiveToday = getTodayWithReset();
     const filtered = meals.filter(meal => {
@@ -302,6 +305,18 @@ export default function RecentMeals() {
     filtered.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
     setTodayMeals(filtered);
   }, [meals]);
+
+  // Auto-open the edit modal when arriving from the chat's edit button.
+  useEffect(() => {
+    const targetId = route.params?.openMealId;
+    if (!targetId || lastOpenedMealIdRef.current === targetId) return;
+    const target = meals.find((m) => m.id === targetId);
+    if (target) {
+      lastOpenedMealIdRef.current = targetId;
+      setEditingMeal(target);
+      setShowEditModal(true);
+    }
+  }, [route.params?.openMealId, meals]);
 
   // Exit delete mode when no meals left
   useEffect(() => {

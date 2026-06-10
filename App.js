@@ -17,6 +17,9 @@ import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { AppProvider } from './src/context/AppContext';
 import { StatusBar } from 'expo-status-bar';
 import { View, StyleSheet, Image, Text, AppState } from 'react-native';
+import ForceUpdateScreen from './src/components/ForceUpdateScreen';
+import { checkAppVersionPolicy } from './src/api/appVersionPolicy';
+import { setUpdateRequiredListener } from './src/utils/updateRequiredBridge';
 import * as Notifications from 'expo-notifications';
 import useNotifications from './src/hooks/useNotifications';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -150,8 +153,32 @@ const MainStack = ({ hasCompletedOnboarding }) => {
 export default function App() {
   const [authState, setAuthState] = useState('initializing');
   const [session, setSession] = useState(null);
+  const [versionGate, setVersionGate] = useState({ status: 'checking' });
   const initRef = useRef(false);
   const authResolvedRef = useRef(false);
+
+  const runVersionCheck = () => {
+    checkAppVersionPolicy().then(setVersionGate);
+  };
+
+  useEffect(() => {
+    runVersionCheck();
+    setUpdateRequiredListener(({ storeUrl, message, minVersion }) => {
+      setVersionGate({
+        status: 'forceUpdate',
+        storeUrl,
+        message,
+        minVersion,
+      });
+    });
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') runVersionCheck();
+    });
+    return () => {
+      sub.remove();
+      setUpdateRequiredListener(null);
+    };
+  }, []);
 
   useEffect(() => {
     if (initRef.current) return;
@@ -220,6 +247,26 @@ export default function App() {
       clearTimeout(timeout);
     };
   }, []);
+
+  if (versionGate.status === 'checking') {
+    return (
+      <SafeAreaProvider>
+        <LoadingScreen />
+      </SafeAreaProvider>
+    );
+  }
+
+  if (versionGate.status === 'forceUpdate') {
+    return (
+      <SafeAreaProvider>
+        <ForceUpdateScreen
+          minVersion={versionGate.minVersion}
+          storeUrl={versionGate.storeUrl}
+          message={versionGate.message}
+        />
+      </SafeAreaProvider>
+    );
+  }
 
   if (authState === 'initializing') {
     return (

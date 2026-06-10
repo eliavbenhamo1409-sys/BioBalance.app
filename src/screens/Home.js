@@ -41,16 +41,9 @@ import Animated, {
 } from 'react-native-reanimated';
 import { base44 } from '../api/base44Client';
 import { chatWithBot, analyzeFoodFromImage, parseFoodFromText, estimate3DWeight } from '../api/aiClient';
-import { processUserMessage, INTENTS, getGreeting, getSmartFollowUp, newMealGroupId } from '../api/smartChatbot';
-import { prefillAskQuantityHints } from '../api/chatFoodResolver';
-import {
-  attachPortionGuesses,
-  buildPortionConfirmIntro,
-  defaultTotalGramsForFood,
-} from '../utils/standardPortionGuess';
-import PortionConfirmCard from '../components/chat/PortionConfirmCard';
-import { userMessageImpliesFoodQuantity } from '../utils/userMessageQuantityHints';
-import { getDailyUsage, RateLimitError } from '../api/geminiClient';
+import { processUserMessage, completePendingAddFood, INTENTS, getGreeting, getSmartFollowUp } from '../api/smartChatbot';
+import { defaultTotalGramsForFood } from '../utils/standardPortionGuess';
+import { getDailyUsage, RateLimitError, UpdateRequiredError } from '../api/geminiClient';
 import { askBrachotAssistant } from '../api/brachotAssistant';
 import {
   buildMealPlan,
@@ -77,6 +70,7 @@ import BalanceHeader from '../components/BalanceHeader';
 import GoalCelebration from '../components/GoalCelebration';
 import DailyGoalCelebration from '../components/DailyGoalCelebration';
 import DailyMealPlanCard from '../components/chat/DailyMealPlanCard';
+import QuantityPromptCard from '../components/chat/QuantityPromptCard';
 import moment from 'moment';
 import 'moment/locale/he';
 
@@ -170,32 +164,6 @@ const SPRING_CONFIG = {
   restSpeedThreshold: 0.001,
 };
 
-/** True when chat-resolved food names overlap pending portion-confirm foods (clear stale pending). */
-function portionPendingOverlapsIncoming(pendingFoods, resolvedFoodRows) {
-  const norm = (s) =>
-    String(s ?? '')
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, ' ')
-      .replace(/['׳]/g, '');
-
-  const pendingNs = (pendingFoods || []).map((f) => norm(f?.name)).filter(Boolean);
-  const incomingNs = (resolvedFoodRows || []).map((f) => norm(f?.name)).filter(Boolean);
-  if (!pendingNs.length || !incomingNs.length) return false;
-
-  const overlaps = (a, b) =>
-    !!(a &&
-      b &&
-      (a === b ||
-        (a.length >= 2 &&
-          b.length >= 2 &&
-          (a.includes(b) || b.includes(a)))));
-
-  return incomingNs.some((iname) =>
-    pendingNs.some((pname) => overlaps(pname, iname)),
-  );
-}
-
 export default function Home() {
   const navigation = useNavigation();
   const scrollViewRef = useRef(null);
@@ -217,9 +185,16 @@ export default function Home() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const hasGreetedRef = useRef(false);
   const [conversationHistory, setConversationHistory] = useState([]);
-  const [pendingFoods, setPendingFoods] = useState([]); // Foods waiting for quantity
-  /** bot message ids for `portion_confirm` cards already submitted */
-  const [appliedPortionIds, setAppliedPortionIds] = useState({});
+  // Foods kept around only for the image / 3D capture flows that still drive a
+  // small approval confirm card (camera path). The chat flow no longer uses
+  // this pending state.
+  const [pendingFoods, setPendingFoods] = useState([]);
+  /** In-chat quantity card for countable-ambiguous foods (pizza slices, etc.) */
+  const [pendingAmbiguous, setPendingAmbiguous] = useState(null);
+  // Map of bot message id -> meal ids that the message logged. Drives the
+  // small green "edit" pill rendered under each summary bubble so the user
+  // can jump straight to the meals screen and tweak the auto-estimated row.
+  const [messageMealIds, setMessageMealIds] = useState({});
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [showConfetti, setShowConfetti] = useState(false);
   const [celebratedGoals, setCelebratedGoals] = useState({});
@@ -334,6 +309,7 @@ export default function Home() {
           devLog('[Home] New day detected - resetting chat');
           await clearMessagesRef.current();
           setPendingFoods([]);
+          setMessageMealIds({});
           setPendingRecipe(null);
           setShowConfirmButtons(false);
           hasGreetedRef.current = false;
@@ -868,10 +844,14 @@ export default function Home() {
     return '🍽️';
   };
 
-  // Process foods that are ready (have all nutritional data)
-  const processReadyFood = async (foods, batchMeta = {}) => {
+  // Process foods that are ready (have all nutritional data).
+  // When `summaryMsgId` is provided we skip the redundant encouragement
+  // bubble (the chat flow already pushed the detailed summary above) and
+  // we attach the saved meal IDs to that message so the small green
+  // "edit" pill can deep-link into the meals screen.
+  const processReadyFood = async (foods, batchMeta = {}, summaryMsgId = null) => {
     const { meal_group_id, source_message_text } = batchMeta;
-    devLog('[Home] processReadyFood called with:', foods, batchMeta);
+    devLog('[Home] processReadyFood called with:', foods, batchMeta, 'summaryMsgId:', summaryMsgId);
     let totalCalories = 0;
     let totalProtein = 0;
     let totalFat = 0;
@@ -884,11 +864,13 @@ export default function Home() {
       totalCarbs += food.carbs || 0;
     }
 
-    // Step 1: Bot encouragement message
-    const successMsg = getSuccessMessage(totalCalories, (dailyStats?.calories || 0) + totalCalories);
-    await addBotMessage(successMsg);
+    // Cheer bubble only for non-chat paths (e.g. camera). The chat flow
+    // pushed the detailed summary itself.
+    if (!summaryMsgId) {
+      const successMsg = getSuccessMessage(totalCalories, (dailyStats?.calories || 0) + totalCalories);
+      await addBotMessage(successMsg);
+    }
 
-    // Step 2: Update balance (stay collapsed - animations happen in mini rings)
     setTimeout(async () => {
       const newStats = await updateBalanceWithoutGoalCheck(
         totalCalories,
@@ -897,12 +879,12 @@ export default function Home() {
         null,
         totalCarbs
       );
-      
-      // Step 3: Save each food as a meal to the database (skip stats update - already done above)
+
       devLog('[Home] processReadyFood: Saving', foods.length, 'meals');
+      const savedMealIds = [];
       for (const food of foods) {
         devLog('[Home] processReadyFood: Calling addMeal for:', food.name);
-        await addMeal({
+        const savedMeal = await addMeal({
           name: food.name || 'ארוחה',
           calories: food.calories || 0,
           protein: food.protein || 0,
@@ -912,26 +894,29 @@ export default function Home() {
           nutrition_metadata: food.nutrition_metadata || null,
           meal_group_id: meal_group_id ?? null,
           source_message_text: source_message_text ?? null,
-        }, true); // skipStatsUpdate = true
+        }, true);
+        if (savedMeal?.id) savedMealIds.push(savedMeal.id);
       }
-      devLog('[Home] processReadyFood: Done saving meals');
+      devLog('[Home] processReadyFood: Done saving meals', savedMealIds);
 
-      // Reset the inactivity nudge timer.
+      if (summaryMsgId && savedMealIds.length) {
+        setMessageMealIds((prev) => ({
+          ...prev,
+          [summaryMsgId]: savedMealIds,
+        }));
+      }
+
       updateLastFoodLog();
 
-      // Wait a moment then check goals
       setTimeout(() => {
-        // Check if goal reached
         const goalReached = checkGoalReached(newStats);
 
         if (!goalReached) {
-          // No goal - send follow-up message
           setTimeout(async () => {
             const followUp = getFollowUpMessage(newStats);
             await addBotMessage(followUp);
           }, 900);
         }
-        // If goal reached, handleCelebrationComplete will close header
       }, 2000);
     }, 600);
   };
@@ -1041,6 +1026,7 @@ export default function Home() {
     if (type === 'text') {
       setConversationHistory(prev => [...prev, { role: 'assistant', content: text }]);
     }
+    return uniqueId;
   };
 
   const addUserMessage = (text) => {
@@ -1059,8 +1045,10 @@ export default function Home() {
     const waterPct = ((newStats.water_glasses || 0) / targets.water) * 100;
 
     // Check if ALL goals are reached - THIS TAKES PRIORITY!
+    // Calories: only require ≥90% (no upper cap). Overshooting calories still
+    // counts as "hit all targets" — the chat reply already comments on overshoot.
     const allGoalsReached =
-      caloriesPct >= 90 && caloriesPct <= 115 &&
+      caloriesPct >= 90 &&
       proteinPct >= 100 &&
       fatPct >= 100 &&
       waterPct >= 100;
@@ -1191,6 +1179,174 @@ export default function Home() {
     chatGenAbortRef.current?.abort();
   };
 
+  const buildChatContext = useCallback(
+    (overrides = {}) => {
+      const STRUCTURED_BOT_TYPES = new Set([
+        'food_card',
+        'recipe_card',
+        'recipe_save_banner',
+        'meal_plan',
+        'brachot_advice',
+        'quantity_prompt',
+      ]);
+      const placeholderForType = (t) => {
+        switch (t) {
+          case 'food_card':
+            return '[ממשק: הוצג כרטיס מנה שנרשמה]';
+          case 'recipe_card':
+            return '[ממשק: הוצג כרטיס מתכון]';
+          case 'recipe_save_banner':
+            return '[ממשק: הוצעה שמירת מתכון]';
+          case 'meal_plan':
+            return '[ממשק: הוצגה תפריט יומי]';
+          case 'brachot_advice':
+            return '[ממשק: הוצגה ברכה]';
+          case 'quantity_prompt':
+            return '[ממשק: נשאלת כמות למאכל]';
+          default:
+            return '';
+        }
+      };
+      const UI_LEAK_PATTERNS = [
+        /לחצו\s*על\s*הכפתור/i,
+        /תיפתח\s*שקופית/i,
+        /רוצה\s*לוודא\s*איתכם/i,
+      ];
+      const sanitizeBotText = (raw) => {
+        const t = String(raw || '').trim();
+        if (!t) return '';
+        if (UI_LEAK_PATTERNS.some((re) => re.test(t))) {
+          return '[ממשק: הוצגה הודעה ישנה]';
+        }
+        return t.length > 280 ? `${t.slice(0, 280)}…` : t;
+      };
+
+      return {
+        conversationHistory: messages
+          .slice(-10)
+          .map((m) => {
+            if (m.isBot && STRUCTURED_BOT_TYPES.has(m.type)) {
+              return { isBot: true, text: placeholderForType(m.type) };
+            }
+            if (m.isBot) {
+              return { isBot: true, text: sanitizeBotText(m.text) };
+            }
+            return { isBot: false, text: String(m.text || '').slice(0, 500) };
+          })
+          .filter((m) => m.text && m.text.length > 0),
+        pendingAction:
+          pendingFoods.length > 0
+            ? { type: 'waiting_quantity', foods: pendingFoods }
+            : null,
+        dailyStats: dailyStats || {},
+        targets: targets || {},
+        userName: profile?.first_name || '',
+        goal: profile?.goal || 'maintain',
+        signal: overrides.signal,
+        mealGroupOverride: overrides.mealGroupOverride ?? null,
+      };
+    },
+    [messages, pendingFoods, dailyStats, targets, profile],
+  );
+
+  const handleQuantityConfirm = async ({ quantity, mode }) => {
+    if (!pendingAmbiguous || isProcessingRef.current) return;
+
+    isProcessingRef.current = true;
+    const stash = pendingAmbiguous;
+    const { food, unitPlural, originalText, mealGroupId, summaryMsgId } = stash;
+    const tag = mode === 'gram' ? `${quantity} גרם` : `${quantity} ${unitPlural}`;
+    const refined = `${originalText} (${tag})`;
+
+    setPendingAmbiguous(null);
+    setIsTyping(true);
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === summaryMsgId
+          ? { ...m, data: { ...m.data, processing: true } }
+          : m,
+      ),
+    );
+
+    const ac = new AbortController();
+    chatGenAbortRef.current = ac;
+    setChatGenAbortable(true);
+
+    try {
+      const context = buildChatContext({
+        signal: ac.signal,
+        mealGroupOverride: mealGroupId,
+      });
+      const result2 = await processUserMessage(refined, context);
+
+      setConsecutiveErrors(0);
+      setDailyUsage((prev) => {
+        if (prev) return { ...prev, used: (prev.used || 0) + 1 };
+        return { used: 1, limit: DAILY_LIMIT };
+      });
+
+      await handleSmartBotAction(result2, refined);
+
+      setMessages((prev) => prev.filter((m) => m.id !== summaryMsgId));
+    } catch (error) {
+      setIsTyping(false);
+      if (error?.code === 'USER_CANCEL') return;
+      console.error('Quantity confirm error:', error);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === summaryMsgId
+            ? {
+                ...m,
+                data: {
+                  ...m.data,
+                  processing: false,
+                  resolvedLabel: `${food.name}: ${tag}`,
+                },
+              }
+            : m,
+        ),
+      );
+      await addBotMessage('לא הצלחתי לרשום עם הכמות שבחרת. נסה שוב?');
+    } finally {
+      isProcessingRef.current = false;
+      chatGenAbortRef.current = null;
+      setChatGenAbortable(false);
+      setIsTyping(false);
+    }
+  };
+
+  const handleQuantitySkip = async () => {
+    if (!pendingAmbiguous || isProcessingRef.current) return;
+
+    isProcessingRef.current = true;
+    const stash = pendingAmbiguous;
+    const { originalResult, originalText, summaryMsgId } = stash;
+
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === summaryMsgId
+          ? {
+              ...m,
+              data: { ...m.data, resolvedLabel: 'השארתי את הערכת ברירת המחדל' },
+            }
+          : m,
+      ),
+    );
+    setPendingAmbiguous(null);
+
+    try {
+      const completed = await completePendingAddFood(
+        originalResult,
+        originalText,
+        buildChatContext(),
+      );
+      await handleSmartBotAction(completed, originalText);
+    } finally {
+      isProcessingRef.current = false;
+      setIsTyping(false);
+    }
+  };
+
   // ============================================================
   // NEW SMART CHATBOT - Context-Aware Message Handler
   // ============================================================
@@ -1237,90 +1393,12 @@ export default function Home() {
     setChatGenAbortable(true);
 
     try {
-      // Build context for smart chatbot.
-      // IMPORTANT: structured UI cards (portion_confirm/food_card/recipe_card/meal_plan/brachot_advice)
-      // carry long Hebrew template text the model can mimic, breaking JSON-mode replies.
-      // Replace those with a short placeholder so the LLM doesn't echo our UI copy back as plain text.
-      const STRUCTURED_BOT_TYPES = new Set([
-        'portion_confirm',
-        'food_card',
-        'recipe_card',
-        'recipe_save_banner',
-        'meal_plan',
-        'brachot_advice',
-      ]);
-      const placeholderForType = (t) => {
-        switch (t) {
-          case 'portion_confirm':
-            return '[ממשק: הוצג כרטיס אישור מנה (כפתור הוסף / לא)]';
-          case 'food_card':
-            return '[ממשק: הוצג כרטיס מנה שנרשמה]';
-          case 'recipe_card':
-            return '[ממשק: הוצג כרטיס מתכון]';
-          case 'recipe_save_banner':
-            return '[ממשק: הוצעה שמירת מתכון]';
-          case 'meal_plan':
-            return '[ממשק: הוצגה תפריט יומי]';
-          case 'brachot_advice':
-            return '[ממשק: הוצגה ברכה]';
-          default:
-            return '';
-        }
-      };
+      const context = buildChatContext({ signal: ac.signal });
 
-      // Older sessions saved plain-text bot bubbles that contain the same UI
-      // template (e.g. "לחצו על הכפתור הירוק הוסף", "תיפתח שקופית עם סרגל").
-      // If we feed that back, the LLM mimics it and stops returning JSON.
-      // Strip / shorten any bot text that smells like UI copy.
-      const UI_LEAK_PATTERNS = [
-        /לחצו\s*על\s*הכפתור/i,
-        /תיפתח\s*שקופית/i,
-        /רוצה\s*לוודא\s*איתכם/i,
-        /הכפתור\s*הירוק/i,
-      ];
-      const sanitizeBotText = (raw) => {
-        const t = String(raw || '').trim();
-        if (!t) return '';
-        if (UI_LEAK_PATTERNS.some((re) => re.test(t))) {
-          return '[ממשק: הוצג כרטיס אישור מנה (כפתור הוסף / לא)]';
-        }
-        return t.length > 280 ? `${t.slice(0, 280)}…` : t;
-      };
-
-      const context = {
-        conversationHistory: messages
-          .slice(-10)
-          .map((m) => {
-            if (m.isBot && STRUCTURED_BOT_TYPES.has(m.type)) {
-              return { isBot: true, text: placeholderForType(m.type) };
-            }
-            if (m.isBot) {
-              return { isBot: true, text: sanitizeBotText(m.text) };
-            }
-            return { isBot: false, text: String(m.text || '').slice(0, 500) };
-          })
-          .filter((m) => m.text && m.text.length > 0),
-        pendingAction: pendingFoods.length > 0 ? {
-          type: 'waiting_quantity',
-          foods: pendingFoods,
-        } : null,
-        dailyStats: dailyStats || {},
-        targets: targets || {},
-        userName: profile?.first_name || '',
-        goal: profile?.goal || 'maintain', // User goal: cut, maintain, bulk, lean_bulk
-        signal: ac.signal,
-      };
-
-      // Call smart chatbot
+      // Call smart chatbot.
+      // The typing indicator is cleared by `addBotMessage` (which manages
+      // its own indicator) and the `finally` block below as a safety net.
       const result = await processUserMessage(userText, context);
-      // NOTE: do NOT turn off the typing indicator here.
-      // For portion_confirm / ask_quantity flows, handleSmartBotAction still
-      // has work to do (e.g. `prefillAskQuantityHints` USDA lookups) before
-      // the confirm card is rendered. Killing the dots here creates a
-      // visible "silent gap" between the dots and the card. The dots are
-      // turned off either by `addBotMessage` (which manages its own
-      // indicator) or right before each portion-confirm `addMessage`, and
-      // the `finally` block below acts as a safety net.
 
       devLog('🤖 Smart Bot Result:', result.intent, result.action?.type);
 
@@ -1332,12 +1410,49 @@ export default function Home() {
         return { used: 1, limit: DAILY_LIMIT };
       });
 
+      if (result.action?.type === 'add_food' && result.action.data?.quantityPrompt) {
+        const prompt = result.action.data.quantityPrompt;
+        if (prompt) {
+          setIsTyping(false);
+          const cardTitle =
+            prompt.promptTitle || `כמה ${prompt.food.name} אכלת?`;
+          const msgId = await addBotMessage(
+            cardTitle,
+            'quantity_prompt',
+            prompt,
+          );
+          setPendingAmbiguous({
+            mealGroupId: result.action.data?.meal_group_id,
+            originalText: userText,
+            originalResult: result,
+            summaryMsgId: msgId,
+            food: prompt.food,
+            key: prompt.key,
+            unitSingular: prompt.unitSingular,
+            unitPlural: prompt.unitPlural,
+            gramsPerUnit: prompt.gramsPerUnit,
+          });
+          return;
+        }
+      }
+
       await handleSmartBotAction(result, userText);
 
     } catch (error) {
       setIsTyping(false);
 
       if (error?.code === 'USER_CANCEL') {
+        return;
+      }
+
+      if (
+        error instanceof UpdateRequiredError ||
+        error?.code === 'UPDATE_REQUIRED'
+      ) {
+        await addBotMessage(
+          error.message ||
+            'כדי להמשיך להשתמש בצ\'אט יש לעדכן את האפליקציה.',
+        );
         return;
       }
 
@@ -1389,45 +1504,37 @@ export default function Home() {
   const handleSmartBotAction = async (result, lastUserText = '') => {
     const { intent, response, action } = result;
 
-    const quantityCueInMessage =
-      typeof lastUserText === 'string' && userMessageImpliesFoodQuantity(lastUserText);
-
-    const skipResponseBubble =
-      (action?.type === 'ask_quantity' && !quantityCueInMessage) ||
-      action?.type === 'confirm_portions';
-
-    if (response && !skipResponseBubble) {
-      await addBotMessage(response);
+    // Push the bot's summary bubble first and remember its id so the
+    // `add_food` branch can wire saved meal IDs back to it (drives the
+    // small green "edit" pill).
+    let summaryMsgId = null;
+    if (response && String(response).trim()) {
+      summaryMsgId = await addBotMessage(response);
     }
 
-    // Handle specific actions
     if (action) {
       switch (action.type) {
         case 'add_food':
           if (action.data?.foods?.length > 0) {
-            const incoming = action.data.foods;
-            if (
-              pendingFoods.length > 0 &&
-              portionPendingOverlapsIncoming(pendingFoods, incoming)
-            ) {
-              setPendingFoods([]);
-            }
+            const msgIdForMeals = summaryMsgId;
             setTimeout(async () => {
-              await processReadyFood(action.data.foods, {
-                meal_group_id: action.data.meal_group_id,
-                source_message_text: action.data.source_message_text,
-              });
+              await processReadyFood(
+                action.data.foods,
+                {
+                  meal_group_id: action.data.meal_group_id,
+                  source_message_text: action.data.source_message_text,
+                },
+                msgIdForMeals,
+              );
             }, 500);
           }
           break;
 
-        case 'add_water':
-          // Add water glasses
+        case 'add_water': {
           const glasses = action.data?.glasses || 1;
           for (let i = 0; i < glasses; i++) {
             await contextAddWater();
           }
-          // Show follow-up
           setTimeout(async () => {
             const newWater = (dailyStats?.water_glasses || 0) + glasses;
             const remaining = (targets.water || 8) - newWater;
@@ -1436,83 +1543,24 @@ export default function Home() {
             }
           }, 800);
           break;
-
-        case 'confirm_portions':
-          if (action.data?.items?.length > 0) {
-            setPendingFoods(action.data.items);
-            const intro = buildPortionConfirmIntro(action.data.items);
-            const uniqueId = `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-            // Swap the typing dots for the confirm card in a single render.
-            setIsTyping(false);
-            addMessage({
-              text: intro,
-              isBot: true,
-              id: uniqueId,
-              type: 'portion_confirm',
-              data: {
-                items: action.data.items,
-                batchMeta: {
-                  source_message_text: action.data.source_message_text ?? null,
-                  water_glasses: Number(action.data.water_glasses) || 0,
-                },
-              },
-            });
-          }
-          break;
+        }
 
         case 'ask_quantity':
-          if (quantityCueInMessage) {
-            devLog('[Home] Skipping portion card: user message includes quantity cues');
-            if (response && String(response).trim()) {
-              await addBotMessage(response);
-            } else {
-              await addBotMessage(
-                'לא הצלחתי לסיים את הרישום מההודעה. נסה לשלוח שוב.'
-              );
-            }
-            break;
-          }
-          if (action.data?.foods?.length > 0) {
-            try {
-              // Keep the typing dots visible during this lookup. Killing them
-              // earlier creates a visible silent gap before the card.
-              const hinted = await prefillAskQuantityHints(action.data.foods);
-              const withGuesses = attachPortionGuesses(hinted);
-              setPendingFoods(withGuesses);
-              const intro = buildPortionConfirmIntro(withGuesses);
-              const uniqueId = `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-              setIsTyping(false);
-              addMessage({
-                text: intro,
-                isBot: true,
-                id: uniqueId,
-                type: 'portion_confirm',
-                data: { items: withGuesses },
-              });
-            } catch (e) {
-              console.warn('[Home] prefillAskQuantityHints:', e);
-              const fallback = attachPortionGuesses(action.data.foods);
-              setPendingFoods(fallback);
-              const intro = buildPortionConfirmIntro(fallback);
-              setIsTyping(false);
-              addMessage({
-                text: intro,
-                isBot: true,
-                id: `portion_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-                type: 'portion_confirm',
-                data: { items: fallback },
-              });
-            }
+          // No more confirm-card interruptions. If the model still asked for
+          // a quantity, the summary bubble above already nudges the user;
+          // otherwise we surface a short ask so the user can re-send.
+          if (!summaryMsgId) {
+            await addBotMessage(
+              'כמה אכלת? פרט גרם, מנה, פרוסה או כמות (לדוגמה: "150 גרם פסטה" או "2 פיתות").',
+            );
           }
           break;
 
         case 'show_alternatives':
-          // Alternatives are shown in the response text
-          // No additional action needed
+          // Alternatives are shown in the response text.
           break;
 
         case 'show_recipe':
-          // Handle recipe display
           if (action.data?.recipe) {
             setPendingRecipe({
               title: action.data.recipe.title || 'מתכון',
@@ -1530,7 +1578,6 @@ export default function Home() {
           break;
 
         default:
-          // No specific action needed
           break;
       }
     }
@@ -2012,28 +2059,28 @@ export default function Home() {
       );
     }
 
-    if (msg.type === 'portion_confirm' && msg.data?.items?.length) {
+    if (msg.type === 'quantity_prompt' && msg.data) {
+      if (msg.data.processing) return null;
+      const isActive = pendingAmbiguous?.summaryMsgId === msg.id;
       return (
-        <View key={msg.id || `msg_${index}`} style={{ gap: 8 }}>
-          <PortionConfirmCard
-            introText={msg.text || ''}
-            items={msg.data.items}
-            locked={!!appliedPortionIds[msg.id]}
-            onApplied={async (foods) => {
-              setAppliedPortionIds((prev) => ({ ...prev, [msg.id]: true }));
-              setPendingFoods([]);
-              const meta = msg.data?.batchMeta || {};
-              await processReadyFood(foods, {
-                meal_group_id: newMealGroupId(),
-                source_message_text: meta.source_message_text ?? null,
-              });
-              const wg = Number(meta.water_glasses) || 0;
-              for (let w = 0; w < wg; w++) {
-                await contextAddWater();
-              }
-            }}
-          />
-        </View>
+        <QuantityPromptCard
+          key={msg.id || `msg_${index}`}
+          foodName={msg.data.food?.name || msg.text}
+          promptTitle={msg.data.promptTitle}
+          unitSingular={msg.data.unitSingular}
+          unitPlural={msg.data.unitPlural}
+          gramsPerUnit={msg.data.gramsPerUnit}
+          defaultMode={msg.data.defaultMode}
+          gramOnly={msg.data.gramOnly}
+          kcalPer100g={
+            msg.data.food?.nutrition_metadata?.kcalPer100g ??
+            msg.data.food?.kcal_per_100g
+          }
+          disabled={!isActive || !!msg.data?.resolvedLabel}
+          resolvedLabel={msg.data?.resolvedLabel}
+          onConfirm={isActive ? handleQuantityConfirm : undefined}
+          onSkip={isActive ? handleQuantitySkip : undefined}
+        />
       );
     }
 
@@ -2067,11 +2114,23 @@ export default function Home() {
     }
     
     if (!msg.text) return null;
+    const linkedMealIds = msg.isBot ? messageMealIds[msg.id] : null;
+    const editButton =
+      linkedMealIds && linkedMealIds.length > 0
+        ? {
+            label: linkedMealIds.length === 1 ? 'ערוך' : `ערוך (${linkedMealIds.length})`,
+            onPress: () =>
+              navigation.navigate('RecentMeals', {
+                openMealId: linkedMealIds[0],
+              }),
+          }
+        : undefined;
     return (
       <ChatMessage
         key={msg.id || `msg_${index}`}
         message={msg.text}
         isBot={msg.isBot}
+        editButton={editButton}
       />
     );
   };

@@ -1,7 +1,8 @@
-import { searchFoodWithScores } from './usdaApi';
-import { validateKcalPer100 } from './nutritionValidation';
 import { normalizeExtractorItem } from './foodQuantityNormalize';
-import { attachPortionGuesses, buildHeuristicPortionGuessForDisplayName } from '../utils/standardPortionGuess';
+import {
+  buildHeuristicPortionGuessForDisplayName,
+  defaultTotalGramsForFood,
+} from '../utils/standardPortionGuess';
 import { buildFoodQuantityAssignment } from '../utils/userMessageFoodBinding';
 
 function throwIfAborted(signal) {
@@ -13,146 +14,7 @@ function throwIfAborted(signal) {
   }
 }
 
-/** Longest Hebrew keyword wins (same idea as smartChatbot). */
-export const HEBREW_FOOD_SEARCH_MAP = {
-  פסטה: 'pasta cooked',
-  אורז: 'rice cooked white',
-  'אורז מלא': 'rice cooked brown',
-  לחם: 'bread white',
-  'לחם מלא': 'bread whole wheat',
-  פיתה: 'pita bread',
-  בטטה: 'sweet potato baked',
-  'תפוח אדמה': 'potato boiled',
-  'שיבולת שועל': 'oats',
-  קוואקר: 'oats',
-  עוף: 'chicken breast cooked',
-  'חזה עוף': 'chicken breast cooked',
-  הודו: 'turkey breast cooked',
-  'חזה הודו': 'turkey breast cooked',
-  טונה: 'tuna canned',
-  סלמון: 'salmon cooked',
-  ביצה: 'egg whole cooked',
-  ביצים: 'eggs whole cooked',
-  קוטג: 'cottage cheese',
-  יוגורט: 'yogurt greek plain',
-  לבנה: 'labneh',
-  חומוס: 'hummus',
-  אבוקדו: 'avocado raw',
-  שקדים: 'almonds',
-  אגוזים: 'walnuts',
-  'אגוזי מלך': 'walnuts',
-  קשיו: 'cashews',
-  פיסטוק: 'pistachios',
-  טחינה: 'tahini',
-  'חמאת בוטנים': 'peanut butter',
-  בוטנים: 'peanuts',
-  בננה: 'banana raw',
-  תפוח: 'apple raw',
-  תפוז: 'orange raw',
-  אשכולית: 'grapefruit raw',
-  ענבים: 'grapes raw',
-  ענב: 'grapes raw',
-  אבטיח: 'watermelon raw',
-  מלון: 'melon cantaloupe raw',
-  אננס: 'pineapple raw',
-  פפאיה: 'papaya raw',
-  מנגו: 'mango raw',
-  קיווי: 'kiwi raw',
-  אגס: 'pear raw',
-  אפרסק: 'peach raw',
-  נקטרינה: 'nectarine raw',
-  שזיף: 'plum raw',
-  אפרסמון: 'persimmon raw',
-  רימון: 'pomegranate raw',
-  דובדבן: 'cherries raw',
-  דובדבנים: 'cherries raw',
-  תות: 'strawberries raw',
-  תותים: 'strawberries raw',
-  פטל: 'raspberries raw',
-  אוכמניות: 'blueberries raw',
-  תאנה: 'fig raw',
-  תאנים: 'figs raw',
-  תמר: 'dates medjool',
-  תמרים: 'dates medjool',
-  צימוקים: 'raisins',
-  לימון: 'lemon raw',
-  קלמנטינה: 'tangerine raw',
-  עגבנייה: 'tomato raw',
-  עגבניה: 'tomato raw',
-  מלפפון: 'cucumber raw',
-  זיתים: 'olives green pickled',
-  זית: 'olives green pickled',
-  גזר: 'carrot raw',
-  סלרי: 'celery raw',
-  גבינה: 'cheese cheddar',
-  'גבינה צהובה': 'cheese cheddar',
-  'גבינה לבנה': 'cheese white 5%',
-  'גבינה בולגרית': 'cheese feta',
-  פטה: 'cheese feta',
-  מוצרלה: 'cheese mozzarella',
-  חלב: 'milk whole 3.25 milkfat',
-  'חלב סויה': 'soy milk',
-  'חלב שקדים': 'almond milk',
-  'חלב שיבולת שועל': 'oat milk',
-  שמנת: 'cream heavy',
-  חמאה: 'butter',
-  'שמן זית': 'olive oil',
-  סטייק: 'beef steak cooked',
-  בקר: 'beef cooked',
-  בשר: 'beef cooked',
-  'בשר טחון': 'ground beef cooked',
-  'חטיף חלבון': 'protein bar',
-  'שייק חלבון': 'protein shake',
-  קינואה: 'quinoa cooked',
-  בורגול: 'bulgur cooked',
-  כוסמת: 'buckwheat cooked',
-  עדשים: 'lentils cooked',
-  שעועית: 'beans cooked',
-  'שעועית שחורה': 'black beans cooked',
-  'שעועית לבנה': 'white beans cooked',
-  אדממה: 'edamame',
-  טופו: 'tofu firm',
-  גרנולה: 'granola',
-  חלבון: 'whey protein',
-  ברוקולי: 'broccoli cooked',
-  כרובית: 'cauliflower cooked',
-  תרד: 'spinach raw',
-  כרוב: 'cabbage raw',
-  פלפל: 'bell pepper',
-  חציל: 'eggplant cooked',
-  זוקיני: 'zucchini cooked',
-  קישוא: 'zucchini cooked',
-  פטריות: 'mushrooms',
-  בצל: 'onion raw',
-  שום: 'garlic raw',
-  חסה: 'lettuce raw',
-  תירס: 'corn cooked',
-  אפונה: 'peas cooked',
-  תמנון: 'octopus cooked',
-  שרימפס: 'shrimp cooked',
-  קלמרי: 'squid cooked',
-  סושי: 'sushi',
-  פיצה: 'pizza cheese',
-  המבורגר: 'hamburger',
-  פלאפל: 'falafel',
-  שווארמה: 'shawarma',
-  גלידה: 'ice cream vanilla',
-  שוקולד: 'chocolate dark',
-  עוגה: 'cake',
-  עוגייה: 'cookie',
-  עוגיות: 'cookies',
-  בורקס: 'pastry',
-  קרואסון: 'croissant',
-  סוכר: 'sugar granulated',
-  דבש: 'honey',
-  סילאן: 'date syrup',
-  ריבה: 'jam',
-  מיץ: 'juice orange',
-  קולה: 'cola',
-  בירה: 'beer',
-  יין: 'wine red',
-};
-
+/** Local per-100g cache for common Hebrew foods (zero-latency fallback). */
 const FALLBACK_HEBREW = {
   סטייק: { kcal100: 250, protein100: 26, fat100: 17, carbs100: 0, en: 'beef steak (estimate)' },
   בשר: { kcal100: 250, protein100: 26, fat100: 17, carbs100: 0, en: 'beef (estimate)' },
@@ -284,26 +146,63 @@ const FALLBACK_HEBREW = {
   קולה: { kcal100: 42, protein100: 0, fat100: 0, carbs100: 11, en: 'cola (estimate)' },
   בירה: { kcal100: 43, protein100: 0.5, fat100: 0, carbs100: 3.6, en: 'beer (estimate)' },
   יין: { kcal100: 85, protein100: 0.1, fat100: 0, carbs100: 2.7, en: 'wine (estimate)' },
+  // Coffee & beverages — typical per-100ml ≈ per-100g values for the drink as
+  // served. Cappuccino / latte assume regular milk; tweak by gram-edit later.
+  קפה: { kcal100: 2, protein100: 0.1, fat100: 0, carbs100: 0, en: 'brewed coffee (estimate)' },
+  'קפה שחור': { kcal100: 2, protein100: 0.1, fat100: 0, carbs100: 0, en: 'black coffee (estimate)' },
+  'קפה הפוך': { kcal100: 40, protein100: 2, fat100: 1.8, carbs100: 3, en: 'cappuccino (estimate)' },
+  אספרסו: { kcal100: 9, protein100: 0.1, fat100: 0.2, carbs100: 1.7, en: 'espresso (estimate)' },
+  קפוצינו: { kcal100: 40, protein100: 2, fat100: 1.8, carbs100: 3, en: 'cappuccino (estimate)' },
+  'קפוצ׳ינו': { kcal100: 40, protein100: 2, fat100: 1.8, carbs100: 3, en: 'cappuccino (estimate)' },
+  לאטה: { kcal100: 55, protein100: 2.8, fat100: 2.8, carbs100: 4.2, en: 'latte (estimate)' },
+  'קפה לאטה': { kcal100: 55, protein100: 2.8, fat100: 2.8, carbs100: 4.2, en: 'latte (estimate)' },
+  מקיאטו: { kcal100: 30, protein100: 1.3, fat100: 1.3, carbs100: 2.5, en: 'macchiato (estimate)' },
+  אמריקאנו: { kcal100: 6, protein100: 0.1, fat100: 0.1, carbs100: 1.2, en: 'americano (estimate)' },
+  'נס קפה': { kcal100: 30, protein100: 1.5, fat100: 1.3, carbs100: 3, en: 'instant coffee w/ milk (estimate)' },
+  נסקפה: { kcal100: 30, protein100: 1.5, fat100: 1.3, carbs100: 3, en: 'instant coffee w/ milk (estimate)' },
+  מאצה: { kcal100: 70, protein100: 3, fat100: 2.5, carbs100: 9, en: 'matcha latte (estimate)' },
+  'מאצה לאטה': { kcal100: 70, protein100: 3, fat100: 2.5, carbs100: 9, en: 'matcha latte (estimate)' },
+  תה: { kcal100: 1, protein100: 0, fat100: 0, carbs100: 0.3, en: 'brewed tea (estimate)' },
+  'תה ירוק': { kcal100: 1, protein100: 0, fat100: 0, carbs100: 0, en: 'green tea (estimate)' },
+  'תה צמחים': { kcal100: 1, protein100: 0, fat100: 0, carbs100: 0.2, en: 'herbal tea (estimate)' },
+  קקאו: { kcal100: 80, protein100: 3.3, fat100: 2.5, carbs100: 11, en: 'hot cocoa w/ milk (estimate)' },
+  'שוקו חם': { kcal100: 85, protein100: 3.4, fat100: 3, carbs100: 11, en: 'hot chocolate (estimate)' },
+  שוקו: { kcal100: 85, protein100: 3.4, fat100: 3, carbs100: 11, en: 'chocolate milk (estimate)' },
+  מילקשייק: { kcal100: 110, protein100: 3.5, fat100: 3, carbs100: 18, en: 'milkshake (estimate)' },
+  'שייק חלב': { kcal100: 90, protein100: 3.5, fat100: 2.5, carbs100: 13, en: 'milkshake (estimate)' },
+  סמודי: { kcal100: 60, protein100: 1, fat100: 0.4, carbs100: 13, en: 'fruit smoothie (estimate)' },
+  'שייק פירות': { kcal100: 60, protein100: 1, fat100: 0.4, carbs100: 13, en: 'fruit smoothie (estimate)' },
+  לימונדה: { kcal100: 40, protein100: 0.1, fat100: 0, carbs100: 10, en: 'lemonade (estimate)' },
+  סודה: { kcal100: 0, protein100: 0, fat100: 0, carbs100: 0, en: 'club soda (estimate)' },
+  'מים מינרליים': { kcal100: 0, protein100: 0, fat100: 0, carbs100: 0, en: 'water (estimate)' },
+  מים: { kcal100: 0, protein100: 0, fat100: 0, carbs100: 0, en: 'water (estimate)' },
 };
 
 export const MAX_FOODS_PER_MESSAGE = 12;
 
-export function resolveEnglishQueryFromHebrewDisplayName(displayName) {
-  const lower = String(displayName).toLowerCase();
-  const sorted = Object.keys(HEBREW_FOOD_SEARCH_MAP).sort((a, b) => b.length - a.length);
-  for (const hk of sorted) {
-    if (lower.includes(hk.toLowerCase())) {
-      return HEBREW_FOOD_SEARCH_MAP[hk];
-    }
-  }
-  return null;
+/**
+ * Normalize Hebrew food names so map lookups survive minor spelling variants:
+ *  - Strip niqqud (U+05B0–U+05C7) so "קָפֶה" matches "קפה".
+ *  - Strip geresh / gershayim / ASCII quote marks so "קפוצ'ינו" matches "קפוצינו".
+ *  - Collapse whitespace.
+ * The original casing is irrelevant for Hebrew but we still lower-case to keep
+ * the previous behaviour for mixed-case English fragments.
+ */
+export function normalizeHebrewFoodName(displayName) {
+  return String(displayName ?? '')
+    .toLowerCase()
+    .replace(/[\u05B0-\u05C7]/g, '')
+    .replace(/['׳״"`]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export function fallbackNutritionForHebrew(displayName) {
-  const lower = String(displayName).toLowerCase();
+  const norm = normalizeHebrewFoodName(displayName);
   const keys = Object.keys(FALLBACK_HEBREW).sort((a, b) => b.length - a.length);
   for (const k of keys) {
-    if (lower.includes(k)) {
+    const nk = normalizeHebrewFoodName(k);
+    if (nk && norm.includes(nk)) {
       return { ...FALLBACK_HEBREW[k], matchedKey: k };
     }
   }
@@ -349,43 +248,33 @@ function foodRowFromBase(displayName, grams, base, meta) {
 
 /**
  * Resolution order:
- *  1. USDA hit that passes kcal/100g validation → high confidence, source='usda'.
- *  2. Hebrew fallback table (kcal/macros tuned per item) → mid confidence, source='fallback_estimate'.
- *  3. USDA top hit even when validation failed → low confidence, source='usda_unvalidated'.
- *     Used as a last-resort so the user gets *something* logged instead of "needs clarification".
- *  4. If we have nutrition hints from the LLM (kcal_per_100g etc.) → source='llm_estimate'.
- *  5. Only then 'clarify'.
+ *  1. Gemini-supplied per-100g from extractor JSON → source='gemini'.
+ *  2. Local Hebrew table → source='local_table'.
+ *  3. Generic estimate → source='generic_estimate' (always logs something).
  */
-async function resolveOneFoodItem(displayName, grams, signal, originalItem) {
-  throwIfAborted(signal);
-  const q = resolveEnglishQueryFromHebrewDisplayName(displayName);
-  const scored = await searchFoodWithScores(q || String(displayName).trim());
-  let chosen = null;
-  let chosenScore = null;
-  let chosenConf = null;
-
-  if (scored?.length) {
-    for (const cand of scored) {
-      const v = validateKcalPer100(displayName, cand.name, cand.calories);
-      if (v.ok) {
-        chosen = cand;
-        chosenScore = cand.matchScore;
-        chosenConf = cand.confidence;
-        break;
-      }
-    }
-  }
-
-  if (chosen) {
+function resolveOneFoodItem(displayName, grams, _signal, originalItem) {
+  const llm = extractLlmNutritionPer100g(originalItem);
+  if (llm) {
+    const base = {
+      fdcId: null,
+      name: displayName,
+      calories: llm.kcal100,
+      protein: llm.protein100,
+      fat: llm.fat100,
+      carbs: llm.carbs100,
+      energyMode: 'gemini',
+      energyNutrientId: null,
+      rawEnergyUnitLabel: null,
+    };
     const meta = buildNutritionMeta({
-      base: chosen,
-      source: 'usda',
-      matchScore: chosenScore,
-      confidence: chosenConf,
-      englishMatched: chosen.name,
+      base,
+      source: 'gemini',
+      matchScore: null,
+      confidence: 0.75,
+      englishMatched: displayName,
       isEstimate: false,
     });
-    return { kind: 'ok', food: foodRowFromBase(displayName, grams, chosen, meta) };
+    return { kind: 'ok', food: foodRowFromBase(displayName, grams, base, meta) };
   }
 
   const fb = fallbackNutritionForHebrew(displayName);
@@ -397,15 +286,15 @@ async function resolveOneFoodItem(displayName, grams, signal, originalItem) {
       protein: fb.protein100,
       fat: fb.fat100,
       carbs: fb.carbs100,
-      energyMode: 'fallback_table',
+      energyMode: 'local_table',
       energyNutrientId: null,
       rawEnergyUnitLabel: null,
     };
     const meta = buildNutritionMeta({
       base,
-      source: 'fallback_estimate',
+      source: 'local_table',
       matchScore: null,
-      confidence: 0.45,
+      confidence: 0.55,
       englishMatched: fb.en,
       isEstimate: true,
     });
@@ -416,70 +305,29 @@ async function resolveOneFoodItem(displayName, grams, signal, originalItem) {
     };
   }
 
-  // Soft fallback: USDA gave us hits but none passed validation. Better to
-  // log the closest match (clearly marked low-confidence) than to refuse.
-  if (scored?.length) {
-    const top = scored[0];
-    const base = {
-      fdcId: top.fdcId ?? null,
-      name: top.name,
-      calories: top.calories,
-      protein: top.protein,
-      fat: top.fat,
-      carbs: top.carbs,
-      energyMode: top.energyMode ?? null,
-      energyNutrientId: top.energyNutrientId ?? null,
-      rawEnergyUnitLabel: top.rawEnergyUnitLabel ?? null,
-    };
-    const meta = buildNutritionMeta({
-      base,
-      source: 'usda_unvalidated',
-      matchScore: top.matchScore,
-      confidence: 0.35,
-      englishMatched: top.name,
-      isEstimate: true,
-    });
-    return {
-      kind: 'ok',
-      food: foodRowFromBase(displayName, grams, base, meta),
-      usedFallbackEstimate: true,
-    };
-  }
-
-  // Last resort: trust the LLM's per-100g numbers if it provided any.
-  // Used when the user names a niche food we never mapped and USDA is silent.
-  const llm = extractLlmNutritionPer100g(originalItem);
-  if (llm) {
-    const base = {
-      fdcId: null,
-      name: `${displayName} (LLM estimate)`,
-      calories: llm.kcal100,
-      protein: llm.protein100,
-      fat: llm.fat100,
-      carbs: llm.carbs100,
-      energyMode: 'llm_estimate',
-      energyNutrientId: null,
-      rawEnergyUnitLabel: null,
-    };
-    const meta = buildNutritionMeta({
-      base,
-      source: 'llm_estimate',
-      matchScore: null,
-      confidence: 0.3,
-      englishMatched: `${displayName} (LLM)`,
-      isEstimate: true,
-    });
-    return {
-      kind: 'ok',
-      food: foodRowFromBase(displayName, grams, base, meta),
-      usedFallbackEstimate: true,
-    };
-  }
-
+  const base = {
+    fdcId: null,
+    name: displayName,
+    calories: 200,
+    protein: 10,
+    fat: 8,
+    carbs: 22,
+    energyMode: 'generic_estimate',
+    energyNutrientId: null,
+    rawEnergyUnitLabel: null,
+  };
+  const meta = buildNutritionMeta({
+    base,
+    source: 'generic_estimate',
+    matchScore: null,
+    confidence: 0.25,
+    englishMatched: displayName,
+    isEstimate: true,
+  });
   return {
-    kind: 'clarify',
-    name: displayName.trim(),
-    question: `לא הצלחתי לקשר בעקביות את "${displayName}" למקור מהימן. מה בדיוק אכלת (סוג ומשקל בגרם)?`,
+    kind: 'ok',
+    food: foodRowFromBase(displayName, grams, base, meta),
+    usedFallbackEstimate: true,
   };
 }
 
@@ -532,17 +380,15 @@ function extractLlmNutritionPer100g(item) {
   return null;
 }
 
-async function lookupFirstValidated(name) {
-  const scored = await searchFoodWithScores(
-    resolveEnglishQueryFromHebrewDisplayName(name) || name
-  );
-  if (!scored?.length) return null;
-  for (const cand of scored) {
-    if (validateKcalPer100(name, cand.name, cand.calories).ok) return cand;
-  }
-  // Soft fallback for portion-confirm hints: prefer *something* over nothing,
-  // so the kcal-per-100g preview shows reasonable numbers even on edge foods.
-  return scored[0] ?? null;
+function lookupLocalNutrition(name) {
+  const fb = fallbackNutritionForHebrew(name);
+  if (!fb) return null;
+  return {
+    calories: fb.kcal100,
+    protein: fb.protein100,
+    fat: fb.fat100,
+    carbs: fb.carbs100,
+  };
 }
 
 function emojiForFood(name) {
@@ -605,10 +451,155 @@ export async function enrichAddFoodFoods(foodsInput, options = {}) {
   };
 }
 
+function macrosFromPer100(grams, p100) {
+  const mult = grams / 100;
+  return {
+    calories: Math.round(p100.kcal * mult),
+    protein: Math.round(p100.protein * mult * 10) / 10,
+    fat: Math.round(p100.fat * mult * 10) / 10,
+    carbs: Math.round(p100.carbs * mult * 10) / 10,
+  };
+}
+
+const QTY_UNIT_HE = {
+  unit: 'יחידה',
+  יחידה: 'יחידה',
+  slice: 'פרוסה',
+  פרוסה: 'פרוסה',
+  פרוסות: 'פרוסות',
+  portion: 'מנה',
+  מנה: 'מנה',
+  gram: 'גרם',
+  g: 'גרם',
+  גרם: 'גרם',
+  tbsp: 'כף',
+  כף: 'כף',
+  כפות: 'כפות',
+  tsp: 'כפית',
+  כפית: 'כפית',
+  כפיות: 'כפיות',
+  handful: 'חופן',
+  חופן: 'חופן',
+  cup: 'כוס',
+  כוס: 'כוס',
+  כוסות: 'כוסות',
+  can: 'קופסה',
+  קופסה: 'קופסה',
+  drink_can: 'פחית',
+  פחית: 'פחית',
+};
+
+function qtyUnitHe(unitRaw) {
+  const u = String(unitRaw ?? '').toLowerCase().trim();
+  return QTY_UNIT_HE[u] || u || 'יחידה';
+}
+
+/** Human-readable quantity line for the confirm card (shown under "QTY."). */
+export function buildQtyLabelForConfirm({
+  grams,
+  rawItem,
+  norm,
+  portionHint,
+  portionGuess,
+}) {
+  const g = Math.max(1, Math.round(Number(grams) || 1));
+  const cleanHint = String(portionHint || '').replace(/\?$/, '').trim();
+
+  if (
+    cleanHint &&
+    !/^הותאם ל-/i.test(cleanHint) &&
+    !/משוערת\s*~150\s*גרם/i.test(cleanHint) &&
+    !/יחידה לא מוכרת/i.test(cleanHint)
+  ) {
+    if (/גרם|g\b/i.test(cleanHint)) return cleanHint;
+    return `${cleanHint} · ${g}g`;
+  }
+
+  const standard = String(portionGuess?.standardLabel || '')
+    .replace(/\?$/, '')
+    .trim();
+  if (standard) {
+    return `${standard} · ${g}g`;
+  }
+
+  const summary = String(portionGuess?.summaryLine || '').replace(/\?$/, '').trim();
+  if (summary && !/בערך\s*150\s*גרם\s*\(כללי\)/i.test(summary)) {
+    if (/גרם|g\b|מ״ל|מ"ל/i.test(summary)) return summary;
+    return `${summary} · ${g}g`;
+  }
+
+  const q = Number(rawItem?.quantity);
+  const unitRaw = String(
+    rawItem?.unit ?? norm?.quantityUnit ?? '',
+  )
+    .toLowerCase()
+    .trim();
+
+  if (Number.isFinite(q) && q > 0 && unitRaw && unitRaw !== 'gram' && unitRaw !== 'g') {
+    const noun = qtyUnitHe(unitRaw);
+    if (unitRaw === 'unit' || unitRaw === 'יחידה') {
+      return q === 1 ? `יחידה אחת · ${g}g` : `${q} יחידות · ${g}g`;
+    }
+    if (unitRaw === 'slice' || unitRaw === 'פרוסה' || unitRaw === 'פרוסות') {
+      return q === 1 ? `פרוסה אחת · ${g}g` : `${q} פרוסות · ${g}g`;
+    }
+    if (unitRaw === 'portion' || unitRaw === 'מנה') {
+      return q === 1 ? `מנה אחת · ${g}g` : `${q} מנות · ${g}g`;
+    }
+    return q === 1 ? `${noun} אחת · ${g}g` : `${q} ${noun} · ${g}g`;
+  }
+
+  if (norm?.normalizedNote && !/^הותאם ל-/i.test(norm.normalizedNote)) {
+    return `${norm.normalizedNote} · ${g}g`;
+  }
+
+  return `${g} גרם`;
+}
+
+function sourceLabelHe(source) {
+  switch (source) {
+    case 'gemini':
+      return 'Gemini';
+    case 'local_table':
+    case 'fallback_estimate':
+      return 'טבלה מקומית';
+    case 'generic_estimate':
+      return 'הערכה כללית';
+    case 'llm_estimate':
+    case 'gemini_estimate':
+      return 'הערכת Gemini';
+    default:
+      return 'מקור משוער';
+  }
+}
+
+function foodToConfirmItem(food, extras = {}) {
+  const meta = food.nutrition_metadata || {};
+  const grams = Number(food.grams) || 1;
+  const mult = 100 / grams;
+  return {
+    name: food.name,
+    grams,
+    calories: food.calories,
+    protein: food.protein,
+    fat: food.fat,
+    carbs: food.carbs,
+    calories_per_100g: meta.kcalPer100g ?? Math.round((food.calories || 0) * mult),
+    protein_per_100g:
+      meta.proteinPer100g ?? Math.round((food.protein || 0) * mult * 10) / 10,
+    fat_per_100g: meta.fatPer100g ?? Math.round((food.fat || 0) * mult * 10) / 10,
+    carbs_per_100g: meta.carbsPer100g ?? Math.round((food.carbs || 0) * mult * 10) / 10,
+    source: meta.source || 'unknown',
+    sourceLabel: sourceLabelHe(meta.source),
+    nutrition_metadata: meta,
+    ...extras,
+  };
+}
+
 /**
- * Portion-confirm card items: USDA per-100g + locked grams from user text or heuristic guess.
+ * Build chat confirm-card rows with full nutrition (Gemini → local table → generic).
  */
-export async function buildConfirmPortionItemsFromUserMessage(
+export async function buildNutritionConfirmItems(
   userText,
   foodsFromModel,
   options = {},
@@ -618,26 +609,172 @@ export async function buildConfirmPortionItemsFromUserMessage(
 
   const raw = Array.isArray(foodsFromModel) ? foodsFromModel : [];
   const meta = buildFoodQuantityAssignment(userText, raw);
-  const hinted = await prefillAskQuantityHints(raw.map((f) => ({ name: f?.name })));
+  const items = [];
 
-  return hinted.map((h, i) => {
-    const m = meta[i];
-    const grams = m?.userAssignedGrams;
-    if (grams != null) {
-      const guessBase = buildHeuristicPortionGuessForDisplayName(h.name);
-      return {
-        ...h,
-        portionGuess: {
-          ...guessBase,
-          defaultGrams: grams,
-          minGrams: grams,
-          maxGrams: grams,
-          step: 1,
-          summaryLine: `${grams} גרם (כמו שכתבתם בהודעה)`,
-        },
-      };
+  for (let i = 0; i < raw.length; i++) {
+    throwIfAborted(signal);
+    const rawItem = raw[i];
+    const name = String(rawItem?.name ?? '').trim() || 'מזון';
+    const norm = normalizeExtractorItem(rawItem);
+    let grams = norm.grams;
+    const assigned = meta[i]?.userAssignedGrams;
+    const userSuppliedExplicitGrams = assigned != null;
+    if (userSuppliedExplicitGrams) {
+      grams = assigned;
+    } else {
+      // No explicit "N גרם" in the user message → never trust Gemini's gram
+      // count for a bare food name. Prefer the per-food typical serving so
+      // the card opens with a realistic default (e.g. פיתה ≈ 60g, ביצה ≈ 50g)
+      // instead of Gemini's "1g". Keeps macros in sync with per-100g values.
+      const guess = buildHeuristicPortionGuessForDisplayName(name);
+      const fromGuess = defaultTotalGramsForFood({ name, portionGuess: guess });
+      if (fromGuess != null) grams = fromGuess;
     }
-    return attachPortionGuesses([h])[0];
+    grams = Math.max(1, Math.round(grams));
+
+    const outcome = resolveOneFoodItem(name, grams, signal, rawItem);
+
+    if (outcome.kind === 'ok') {
+      const guess = buildHeuristicPortionGuessForDisplayName(name);
+      const portionHint =
+        norm.normalizedNote || guess?.standardLabel || guess?.summaryLine || null;
+      items.push(
+        foodToConfirmItem(outcome.food, {
+          portionHint,
+          qtyLabel: buildQtyLabelForConfirm({
+            grams,
+            rawItem,
+            norm,
+            portionHint,
+            portionGuess: guess,
+          }),
+          lockedGrams: assigned != null,
+          normalizationNote: norm.normalizedNote || null,
+        }),
+      );
+    } else {
+      const guess = buildHeuristicPortionGuessForDisplayName(name);
+      const g = defaultTotalGramsForFood({ name, portionGuess: guess }) || grams;
+      const fb = fallbackNutritionForHebrew(name) || {
+        kcal100: 200,
+        protein100: 10,
+        fat100: 8,
+        carbs100: 22,
+      };
+      const macros = macrosFromPer100(g, {
+        kcal: fb.kcal100,
+        protein: fb.protein100,
+        fat: fb.fat100,
+        carbs: fb.carbs100,
+      });
+      items.push({
+        name,
+        grams: g,
+        ...macros,
+        calories_per_100g: fb.kcal100,
+        protein_per_100g: fb.protein100,
+        fat_per_100g: fb.fat100,
+        carbs_per_100g: fb.carbs100,
+        source: 'local_table',
+        sourceLabel: sourceLabelHe('local_table'),
+        portionHint: guess?.standardLabel || guess?.summaryLine || 'ערוך משקל וערכים',
+        qtyLabel: buildQtyLabelForConfirm({
+          grams: g,
+          rawItem,
+          norm,
+          portionHint: guess?.standardLabel || guess?.summaryLine,
+          portionGuess: guess,
+        }),
+        lockedGrams: false,
+        nutrition_metadata: {
+          source: 'local_table',
+          confidence: 0.35,
+          isEstimate: true,
+        },
+      });
+    }
+  }
+
+  return items;
+}
+
+/** @deprecated use buildNutritionConfirmItems */
+export async function buildConfirmPortionItemsFromUserMessage(
+  userText,
+  foodsFromModel,
+  options = {},
+) {
+  return buildNutritionConfirmItems(userText, foodsFromModel, options);
+}
+
+export function recalcConfirmItemFromGrams(item, newGrams) {
+  const g = Math.max(1, Math.round(Number(newGrams) || 1));
+  const k100 = Number(item.calories_per_100g) || 0;
+  const p100 = Number(item.protein_per_100g) || 0;
+  const f100 = Number(item.fat_per_100g) || 0;
+  const c100 = Number(item.carbs_per_100g) || 0;
+  const macros = macrosFromPer100(g, {
+    kcal: k100,
+    protein: p100,
+    fat: f100,
+    carbs: c100,
+  });
+  const qtyLabel = refreshQtyLabelGrams(item.qtyLabel, g);
+  return {
+    ...item,
+    grams: g,
+    qtyLabel,
+    ...macros,
+  };
+}
+
+/** Keep QTY text in sync when user edits grams in the card. */
+export function refreshQtyLabelGrams(qtyLabel, grams) {
+  const g = Math.max(1, Math.round(Number(grams) || 1));
+  const base = String(qtyLabel || '').trim();
+  if (!base) return `${g} גרם`;
+  const withoutGram = base
+    .replace(/\s*·\s*\d+\s*g\s*$/i, '')
+    .replace(/\s*·\s*\d+\s*גרם\s*$/i, '')
+    .replace(/\s*\d+\s*גרם\s*$/i, '')
+    .trim();
+  if (withoutGram) return `${withoutGram} · ${g}g`;
+  return `${g} גרם`;
+}
+
+export function confirmItemsToReadyFoods(items) {
+  return (items || [])
+    .map((it) => ({
+      name: it.name,
+      grams: Math.max(1, Math.round(Number(it.grams) || 1)),
+      calories: Math.round(Number(it.calories) || 0),
+      protein: Number(it.protein) || 0,
+      fat: Number(it.fat) || 0,
+      carbs: Number(it.carbs) || 0,
+      nutrition_metadata: it.nutrition_metadata || {
+        kcalPer100g: it.calories_per_100g,
+        source: it.source,
+      },
+    }))
+    .filter((f) => f.grams > 0);
+}
+
+/** Turn resolved food rows into inline confirm-card items. */
+export function resolvedFoodsToConfirmItems(resolvedFoods) {
+  return (resolvedFoods || []).map((f) => {
+    const meta = f.nutrition_metadata || {};
+    const portionHint =
+      meta.portionHint || meta.standardLabel || meta.summaryLine || null;
+    return foodToConfirmItem(f, {
+      portionHint,
+      qtyLabel: buildQtyLabelForConfirm({
+        grams: f.grams,
+        rawItem: null,
+        norm: null,
+        portionHint,
+        portionGuess: meta.portionGuess || null,
+      }),
+    });
   });
 }
 
@@ -645,7 +782,15 @@ export async function prefillAskQuantityHints(foodsInput) {
   const out = [];
   for (const f of foodsInput || []) {
     const name = String(f?.name ?? '').trim() || 'מזון';
-    let cand = await lookupFirstValidated(name);
+    const llm = extractLlmNutritionPer100g(f);
+    const cand = llm
+      ? {
+          calories: llm.kcal100,
+          protein: llm.protein100,
+          fat: llm.fat100,
+          carbs: llm.carbs100,
+        }
+      : lookupLocalNutrition(name);
     const fb = !cand ? fallbackNutritionForHebrew(name) : null;
 
     if (cand) {
@@ -734,11 +879,19 @@ export function formatFoodLoggedReply(
     needsClarification = [],
     skippedOverCap = [],
     estimateFallbackCount = 0,
+    verifierCorrections = [],
+    verifierApproved = [],
   } = {}
 ) {
   if (!resolvedFoods?.length && !needsClarification?.length) {
     return 'לא הצלחתי לרשום מזון אמין מההודעה. פרט מה אכלת (שם + גרם).';
   }
+
+  const correctionByName = new Map();
+  for (const c of verifierCorrections || []) {
+    if (c?.name) correctionByName.set(c.name, c);
+  }
+  const approvedSet = new Set(verifierApproved || []);
 
   const lines = [];
   let totalCal = 0;
@@ -748,7 +901,12 @@ export function formatFoodLoggedReply(
     const em = emojiForFood(f.name);
     totalCal += f.calories || 0;
     totalProt += f.protein || 0;
-    lines.push(`${em} ${f.name} (${f.grams}g) | ${f.calories} קל`);
+    const verifyMark = correctionByName.has(f.name)
+      ? ' 🔍'
+      : approvedSet.has(f.name)
+        ? ' ✓'
+        : '';
+    lines.push(`${em} ${f.name} (${f.grams}g)${verifyMark} | ${f.calories} קל`);
   }
 
   const dayCal =
@@ -770,6 +928,14 @@ export function formatFoodLoggedReply(
 
   const extras = [];
 
+  if (verifierCorrections?.length) {
+    const lines = verifierCorrections.map((c) => {
+      const head = `🔍 תיקנתי: ${c.name} ≈ ${c.correctedGrams}g (ולא ${c.originalGrams}g)`;
+      return c.reason ? `${head} — ${c.reason}` : head;
+    });
+    extras.push(lines.join('\n'));
+  }
+
   if (skippedOverCap.length) {
     extras.push(
       `זיהיתי עוד פריטים שלא חושבו כאן (${skippedOverCap.length}). שלח את המשך או פרט עד ${MAX_FOODS_PER_MESSAGE} פריטים להודעה.`
@@ -785,7 +951,7 @@ export function formatFoodLoggedReply(
 
   if (estimateFallbackCount > 0) {
     extras.push(
-      `(${estimateFallbackCount} פריטים לפי אומדן פנימי — דיוק נמוך יותר מ־USDA.)`
+      `(${estimateFallbackCount} פריטים לפי אומדן פנימי — דיוק נמוך יותר.)`
     );
   }
 
@@ -814,7 +980,12 @@ export function formatFoodLoggedReply(
     ? '💭 שים לב: הכמות כנראה יותר מכזית. אם אתה מקפיד — צריך לברך ברכת המזון. נוסחים במסך ״ברכת המזון״ בתפריט.'
     : '';
 
-  return [intro, totalsBlock, extras.filter(Boolean).join('\n\n'), birkatHamazonHint]
+  return [
+    intro,
+    totalsBlock,
+    extras.filter(Boolean).join('\n\n'),
+    birkatHamazonHint,
+  ]
     .filter((s) => s && String(s).trim())
     .join('\n\n');
 }

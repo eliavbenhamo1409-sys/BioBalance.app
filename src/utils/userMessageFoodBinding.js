@@ -5,6 +5,30 @@
  */
 
 import { userMessageImpliesFoodQuantity } from './userMessageQuantityHints';
+import { normalizeExtractorItem } from '../api/foodQuantityNormalize';
+
+const PACKAGED_HINT =
+  /מגנום|magnum|סניקרס|snickers|קיט\s*קט|kit\s*kat|מקדונלד|mcdonald|בורגר\s*קינג|burger\s*king|קוקה|coke|פפסי|pepsi|משקה\s*אנרג|red\s*bull|חטיף|פריגת|תנובה|שטראוס|אוסם|עלית|במבה|ביסלי|טוויסט|קרקר|וופל|גלידת|גלידה|ארטיק|סורבה|פיצה\s*מוכנה|חטיף\s*חלבון|protein\s*bar|energy\s*bar/i;
+
+function looksPackagedOrBranded(displayName) {
+  return PACKAGED_HINT.test(String(displayName || ''));
+}
+
+const UNCERTAIN_NORMALIZATION = new Set([
+  'unknown_unit',
+  'unit_default',
+  'portion_estimate',
+  'unit_estimate',
+  'gram_floored',
+]);
+
+/** True when grams came from a heuristic, not explicit user grams. */
+export function foodNormalizationIsUncertain(rawFood) {
+  const norm = normalizeExtractorItem(rawFood || {});
+  if (UNCERTAIN_NORMALIZATION.has(norm.normalizedFrom)) return true;
+  if (String(norm.normalizedFrom || '').startsWith('kitchen_')) return true;
+  return false;
+}
 
 function findFoodStartIndex(lowerText, displayName) {
   const n = String(displayName ?? '').trim();
@@ -174,5 +198,14 @@ export function buildFoodQuantityAssignment(userText, foodsFromModel) {
 
 export function addFoodNeedsPortionConfirm(userText, foodsFromModel) {
   const meta = buildFoodQuantityAssignment(userText, foodsFromModel);
-  return meta.some((m) => m.needsQuantityConfirm);
+  if (meta.some((m) => m.needsQuantityConfirm)) return true;
+
+  const list = Array.isArray(foodsFromModel) ? foodsFromModel : [];
+  if (list.some((f) => foodNormalizationIsUncertain(f))) return true;
+  if (list.some((f) => looksPackagedOrBranded(String(f?.name ?? '')))) return true;
+
+  return false;
 }
+
+/** @deprecated alias — same gate as portion confirm */
+export const addFoodNeedsNutritionConfirm = addFoodNeedsPortionConfirm;

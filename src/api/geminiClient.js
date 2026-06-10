@@ -4,14 +4,17 @@
 // Optional dev-only direct calls: EXPO_PUBLIC_GEMINI_USE_DIRECT + __DEV__
 
 import Constants from 'expo-constants';
+import { Platform } from 'react-native';
 import {
   supabase,
   SUPABASE_URL,
   SUPABASE_ANON_KEY,
 } from './supabaseClient';
+import { emitUpdateRequired } from '../utils/updateRequiredBridge';
 
-export const GEMINI_MODEL = 'gemini-2.5-flash';
-const THINKING_BUDGET = 0;
+export const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+export const GEMINI_VISION_MODEL = 'gemini-3.1-pro-preview';
+const DEFAULT_THINKING_LEVEL = 'low';
 
 const EDGE_FUNCTION_NAME = 'gemini-proxy';
 /** Client timeout must exceed Edge upstream timeout (~25s). */
@@ -30,6 +33,20 @@ export class RateLimitError extends Error {
     this.code = 'DAILY_LIMIT_EXCEEDED';
     this.used = used;
     this.limit = limit;
+  }
+}
+
+/** App must update (from Edge or startup policy). */
+export class UpdateRequiredError extends Error {
+  constructor(message, { storeUrl, minVersion } = {}) {
+    super(
+      message ||
+        'כדי להמשיך להשתמש באפליקציה יש לעדכן לגרסה החדשה',
+    );
+    this.name = 'UpdateRequiredError';
+    this.code = 'UPDATE_REQUIRED';
+    this.storeUrl = storeUrl ?? '';
+    this.minVersion = minVersion ?? '';
   }
 }
 
@@ -166,6 +183,17 @@ async function fetchGeminiDirect(body, options = {}, apiKey) {
   }
 }
 
+function looksLikeCompleteJson(text) {
+  const s = String(text ?? '').trim();
+  if (!s.startsWith('{') || !s.endsWith('}')) return false;
+  try {
+    JSON.parse(s);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function parseGeminiResponse(data) {
   if (data?.error) {
     if (__DEV__) console.error('❌ Gemini API error:', JSON.stringify(data.error));
@@ -175,7 +203,9 @@ function parseGeminiResponse(data) {
     });
   }
 
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+  const candidate = data?.candidates?.[0];
+  const finishReason = candidate?.finishReason;
+  const text = candidate?.content?.parts?.[0]?.text;
 
   if (!text) {
     if (__DEV__) {
@@ -183,6 +213,16 @@ function parseGeminiResponse(data) {
     }
     throw new GeminiInvocationError(GENERIC_UNAVAILABLE_USER_HE, {
       errorKind: 'empty_response',
+      retryable: true,
+    });
+  }
+
+  if (finishReason === 'MAX_TOKENS' && !looksLikeCompleteJson(text)) {
+    if (__DEV__) {
+      console.warn('⚠️ Gemini response truncated (MAX_TOKENS):', text.substring(0, 120));
+    }
+    throw new GeminiInvocationError(GENERIC_UNAVAILABLE_USER_HE, {
+      errorKind: 'truncated',
       retryable: true,
     });
   }
@@ -205,6 +245,16 @@ function truncateGeminiContents(contents, maxChars = MAX_GEMINI_CONTENTS_CHARS) 
 }
 
 function mapParsedEdgeFailure(parsed, status) {
+  if (
+    parsed?.errorKind === 'update_required' ||
+    parsed?.code === 'UPDATE_REQUIRED' ||
+    parsed?.error === 'UPDATE_REQUIRED'
+  ) {
+    return new UpdateRequiredError(parsed?.message, {
+      storeUrl: parsed?.storeUrl,
+      minVersion: parsed?.minVersion,
+    });
+  }
   if (
     parsed?.code === 'DAILY_LIMIT_EXCEEDED' ||
     parsed?.errorKind === 'quota' ||
@@ -295,6 +345,7 @@ const invokeProxy = async (body, options = {}) => {
             'Content-Type': 'application/json',
             'x-app-version': version,
             'x-app-build': build,
+            'x-app-platform': Platform.OS === 'android' ? 'android' : 'ios',
             'x-request-id': String(body.requestId ?? ''),
           },
           body: JSON.stringify(body),
@@ -361,6 +412,13 @@ const invokeProxy = async (body, options = {}) => {
       }
 
       if (payload?.ok === true && payload?.gemini != null) {
+        if (payload.updateRequired) {
+          emitUpdateRequired({
+            storeUrl: payload.storeUrl,
+            message: payload.message,
+            minVersion: payload.minVersion,
+          });
+        }
         return payload;
       }
 
@@ -372,6 +430,7 @@ const invokeProxy = async (body, options = {}) => {
       clearTimeout(timeoutId);
       externalSignal?.removeEventListener('abort', onExternalAbort);
       if (err instanceof RateLimitError) throw err;
+      if (err instanceof UpdateRequiredError) throw err;
       if (err instanceof GeminiInvocationError) throw err;
       if (err?.name === 'AbortError') {
         if (timedOut) {
@@ -420,66 +479,96 @@ const invokeProxy = async (body, options = {}) => {
 };
 
 export const callGemini = async (messages, options = {}) => {
-  const model = options.model || GEMINI_MODEL;
-  let geminiContents = convertToGeminiFormat(messages);
-  geminiContents = truncateGeminiContents(geminiContents);
+  const runOnce = async (opts) => {
+    const model = opts.model || GEMINI_MODEL;
+    let geminiContents = convertToGeminiFormat(messages);
+    geminiContents = truncateGeminiContents(geminiContents);
 
-  const messageId = options.messageId || randomUUID();
-  const requestId = options.requestId || randomUUID();
+    const messageId = opts.messageId || randomUUID();
+    const requestId = opts.requestId || randomUUID();
 
-  if (__DEV__) {
-    console.log(`🤖 Gemini call (${model}) mid=${messageId}`);
-  }
+    if (__DEV__) {
+      console.log(`🤖 Gemini call (${model}) mid=${messageId}`);
+    }
 
-  const generationConfig = {
-    temperature: options.temperature ?? 0.4,
-    maxOutputTokens: options.maxTokens || options.maxOutputTokens || 800,
-    topP: 0.8,
-    topK: 40,
+    const maxOut = opts.maxTokens || opts.maxOutputTokens || 800;
+    const generationConfig = {
+      maxOutputTokens: maxOut,
+    };
+
+    if (opts.responseMimeType) {
+      generationConfig.responseMimeType = opts.responseMimeType;
+    }
+
+    const thinkingLevel = opts.thinkingLevel ?? DEFAULT_THINKING_LEVEL;
+    if (thinkingLevel) {
+      generationConfig.thinkingConfig = { thinkingLevel };
+    }
+
+    const innerBody = {
+      model,
+      contents: geminiContents,
+      generationConfig,
+      safetySettings: [
+        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
+        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+      ],
+    };
+
+    const envelope = {
+      ...innerBody,
+      messageId,
+      requestId,
+    };
+
+    const proxyOpts = {
+      signal: opts.signal,
+      timeoutMs: opts.timeoutMs,
+      transportRetries: opts.transportRetries ?? 1,
+    };
+
+    const directKey = getDirectApiKey();
+    if (useDirectOnlyDev() && directKey) {
+      await consumeRateLimitSlotOrThrow();
+      const data = await fetchGeminiDirect(innerBody, opts, directKey);
+      return parseGeminiResponse(data);
+    }
+
+    const wrapped = await invokeProxy(envelope, proxyOpts);
+    if (wrapped?.updateRequired) {
+      emitUpdateRequired({
+        storeUrl: wrapped.storeUrl,
+        message: wrapped.message,
+        minVersion: wrapped.minVersion,
+      });
+    }
+    return parseGeminiResponse(wrapped.gemini);
   };
 
-  if (options.responseMimeType) {
-    generationConfig.responseMimeType = options.responseMimeType;
+  try {
+    return await runOnce(options);
+  } catch (first) {
+    const truncated =
+      first instanceof GeminiInvocationError && first.errorKind === 'truncated';
+    if (truncated && !options._truncationRetried) {
+      const currentMax = options.maxTokens || options.maxOutputTokens || 800;
+      const doubled = Math.min(currentMax * 2, 8192);
+      if (doubled > currentMax) {
+        if (__DEV__) {
+          console.warn(`🔁 Retrying Gemini after truncation (${currentMax} → ${doubled} tokens)`);
+        }
+        return await runOnce({
+          ...options,
+          maxTokens: doubled,
+          maxOutputTokens: doubled,
+          _truncationRetried: true,
+        });
+      }
+    }
+    throw first;
   }
-
-  const thinkingBudget = options.thinkingBudget ?? THINKING_BUDGET;
-  if (thinkingBudget !== undefined) {
-    generationConfig.thinkingConfig = { thinkingBudget };
-  }
-
-  const innerBody = {
-    model,
-    contents: geminiContents,
-    generationConfig,
-    safetySettings: [
-      { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-      { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
-    ],
-  };
-
-  const envelope = {
-    ...innerBody,
-    messageId,
-    requestId,
-  };
-
-  const proxyOpts = {
-    signal: options.signal,
-    timeoutMs: options.timeoutMs,
-    transportRetries: options.transportRetries ?? 1,
-  };
-
-  const directKey = getDirectApiKey();
-  if (useDirectOnlyDev() && directKey) {
-    await consumeRateLimitSlotOrThrow();
-    const data = await fetchGeminiDirect(innerBody, options, directKey);
-    return parseGeminiResponse(data);
-  }
-
-  const wrapped = await invokeProxy(envelope, proxyOpts);
-  return parseGeminiResponse(wrapped.gemini);
 };
 
 export const getDailyUsage = async () => {
@@ -600,4 +689,5 @@ export default {
   RateLimitError,
   GeminiInvocationError,
   GEMINI_MODEL,
+  GEMINI_VISION_MODEL,
 };
